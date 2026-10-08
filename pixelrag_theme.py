@@ -158,9 +158,14 @@ def pt(token: str) -> int:
     return max(1, round(TYPE[token][0] * PX_PER_PT * FONT_SCALE))
 
 
-def font(token: str) -> tuple:
-    """取 tk 字体元组,如 ('Microsoft YaHei UI', 12, 'normal')。"""
-    return (FONT_FAMILY, pt(token), TYPE[token][1])
+def font(token: str, weight: str | None = None) -> tuple:
+    """取 tk 字体元组,如 ('Microsoft YaHei UI', 12, 'normal')。
+
+    ``weight`` 可以覆盖 token 自带的那一档(取值同 tk:``normal`` / ``bold`` /
+    ``italic`` / ``bold italic``)。正文里临时加粗(答案里的小标题)用它 ——
+    字号与行高仍然归 token 管,免得为了一个粗体另起一套数字。
+    """
+    return (FONT_FAMILY, pt(token), weight or TYPE[token][1])
 
 
 def font_mono(size: int = 14) -> tuple:

@@ -292,6 +292,60 @@ def _split_code_blocks(text: str) -> list[tuple[str, str]]:
     return out or [("text", text)]
 
 
+# ---- 答案正文里的行内标记 ---------------------------------------------------
+# 模型给的答案不是纯文本,常见的是「**小标题**」和行首「* 条目」,原样塞进 Text 就会
+# 把星号显示出来。这里只认模型真会写的那三种,不做通用 Markdown —— 宁可漏掉罕见的
+# 写法,也不要把正文里的星号当成标记吃掉(数学式 a*b、脚注 * 之类都很常见)。
+_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.DOTALL)
+_BULLET_RE = re.compile(r"^([ \t]*)\*[ \t]+")
+_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+")
+
+
+def _rich_runs(text: str) -> list[tuple[str, str]]:
+    """把答案正文切成 ``(文字, 标签)``:标签 ``""`` 是普通文字,``"bold"`` 是加粗。
+
+    - ``**强调**`` → 去掉星号,文字加粗(模型常拿它当小标题用,粗体得保住);
+    - 行首 ``#`` 标题 → 去掉 # 号与空格,整行加粗(各级都是加粗,不改字号);
+    - 行首 ``* 条目`` → 星号换成圆点(列表还是列表,屏幕上不再有星号);
+    - ``-`` 开头的列表不动:它不是星号,换成圆点反而和破折号撞脸。
+
+    代码块不经过这里 —— 调用方先用 :func:`_split_code_blocks` 把它们分出去了。
+    """
+    runs: list[tuple[str, str]] = []
+    pos = 0
+    for m in _BOLD_RE.finditer(text):
+        if m.start() > pos:
+            _plain_runs(text[pos : m.start()], runs)
+        runs.append((m.group(1), "bold"))
+        pos = m.end()
+    if pos < len(text):
+        _plain_runs(text[pos:], runs)
+    return runs
+
+
+def _plain_runs(chunk: str, runs: list[tuple[str, str]]) -> None:
+    """普通片段里的行首标记:先换圆点、再剥 ``#`` 标题,逐行处理(换行符原样留着)。"""
+    for line in chunk.splitlines(keepends=True):
+        head = _BULLET_RE.match(line)
+        if head:
+            # 只换星号那一个字符:后面用来对齐的空格原样保留,列表的缩进才不变
+            i = len(head.group(1))
+            line = line[:i] + "•" + line[i + 1 :]
+        m = _HEADING_RE.match(line)
+        if m:
+            body = line[m.end() :]
+            nl = "\n" if body.endswith("\n") else ""
+            body = body[:-1] if nl else body
+            # 整行本来就要加粗,行内的 ** 就只剩标记作用了,一并去掉
+            body = _BOLD_RE.sub(r"\1", body)
+            if body:
+                runs.append((body, "bold"))
+            if nl:
+                runs.append((nl, ""))
+        elif line:
+            runs.append((line, ""))
+
+
 # ---------------------------------------------------------------------------
 # 界面
 # ---------------------------------------------------------------------------
@@ -998,6 +1052,13 @@ class App:
             spacing2=sp2,
             spacing3=sp3,
         )
+        # 行内加粗(答案里的小标题)。它自带行距,理由和代码块一样:粗体的行盒比
+        # 正文字体高 1px,不补 spacing 的话同一段里会隔三差五冒出一行高 1px。
+        bold_font = T.font("answer", "bold")
+        bs1, bs2, bs3 = W.line_spacing(bold_font)
+        txt.tag_configure(
+            "bold", font=bold_font, spacing1=bs1, spacing2=bs2, spacing3=bs3
+        )
         self._answer_text = txt
 
         text = msg.get("text", "")
@@ -1010,19 +1071,32 @@ class App:
         self._render_copy_button(container, text)
 
     def _set_answer_into(self, txt: tk.Text, s: str, settle: bool = False):
-        """整体重写正文。内容短、节流到 60ms 一次,所以不做增量插入。"""
+        """整体重写正文。内容短、节流到 60ms 一次,所以不做增量插入。
+
+        流式也走 :func:`_rich_runs`:否则生成过程中会先看到一堆星号,定稿时才消失。
+        代价是半个标记(``**开头`` 还没等到收尾)会短暂按原样显示,收尾一到就变粗。
+        """
         txt.delete("1.0", "end")
-        txt.insert("1.0", s)
+        self._insert_runs(txt, s)
         W.fit_height(txt, settle=settle)
 
     def _fill_answer(self, txt: tk.Text, text: str):
-        """定稿排版:代码段套 code 标签(等宽 + 淡底 + 内缩)。"""
+        """定稿排版:代码段套 code 标签(等宽 + 淡底 + 内缩),其余按行内标记分粗/不粗。"""
         for seg_kind, seg_text in _split_code_blocks(text):
             if seg_kind == "code":
                 txt.insert("end", seg_text + "\n", "code")
             elif seg_text:
-                txt.insert("end", seg_text)
+                self._insert_runs(txt, seg_text)
         W.fit_height(txt, settle=True)
+
+    @staticmethod
+    def _insert_runs(txt: tk.Text, text: str):
+        """按 :func:`_rich_runs` 的分段插入:加粗的套 bold 标签,其余原样。"""
+        for s, tag in _rich_runs(text):
+            if tag:
+                txt.insert("end", s, tag)
+            else:
+                txt.insert("end", s)
 
     def _render_copy_button(self, parent, text: str):
         bar = tk.Frame(parent, bg=T.c("bg"))
