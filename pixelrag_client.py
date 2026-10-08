@@ -137,6 +137,56 @@ def _load_titles() -> dict[int, str]:
         return {}
 
 
+def refs_of(hits) -> list[dict]:
+    """把命中列表压成"引用页"列表,按 (文章, 页, 段) 去重。
+
+    存进历史的是**数据不是图片**:缩略图由 :func:`history_tiles` 从本地 tiles 现读,
+    所以历史文件很小,而且 tiles 重新渲染过也照样对得上。
+
+    去重是因为同一个问题走不同路径(直接生成 / 降级只显示引用)可能拿到同一页两条命中,
+    不去重历史里就会存两份一模一样的卡片。
+    """
+    out: list[dict] = []
+    seen: set = set()
+    for h in hits or []:
+        if not isinstance(h, dict):
+            continue
+        ref = {
+            "article_id": h.get("article_id"),
+            "tile_index": h.get("tile_index"),
+            "chunk_index": h.get("chunk_index"),
+            "score": h.get("score"),
+            "url": h.get("url"),
+        }
+        key = (ref["article_id"], ref["tile_index"], ref["chunk_index"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def tiles_from(hits) -> list[tuple[str, dict]]:
+    """命中列表 → 引用卡片要的 ``(图片 base64, hit)``。
+
+    按相似度降序排、按 (文章, 页, 段) 去重,并且丢掉没带截图的命中 —— 卡片是靠
+    截图显示"引用的是哪一页"的,没有图就没得显示。
+    """
+    out: list[tuple[str, dict]] = []
+    seen: set = set()
+    for h in sorted(hits or [], key=lambda x: float(x.get("score", 0.0)), reverse=True):
+        if not isinstance(h, dict):
+            continue
+        key = (h.get("article_id"), h.get("tile_index"), h.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        b64 = h.get("image_base64")
+        if b64:
+            out.append((b64, h))
+    return out
+
+
 def history_tiles(item: dict) -> list[tuple[str, dict]]:
     """把历史里的引用页还原成 ``(图片 base64, hit)``。
 
@@ -383,6 +433,7 @@ class App:
         self._sidebar_open = True  # 顶栏「历史」按钮切换它
         self._current_hist: dict | None = None  # 当前打开的那轮问答
         self._hist_entry: dict | None = None  # 本次提问对应的历史条目,答完回填
+        self._refetching = False  # 正在给老记录补检索引用页(同时只补一条)
         self._hist_pos: int | None = None  # None = 不在召回态;0 = 最新一条
         self._hist_draft = ""  # 召回前用户已经敲了一半的内容
         self._serve_ready = check_health()
@@ -1130,6 +1181,19 @@ class App:
 
     def _render_citations(self, msg: dict):
         self._render_section("引用来源")
+        # 补检索来的引用页要写清楚来路:这些页不是当时那几页,不能让人当成本来的出处
+        note = msg.get("note")
+        if note:
+            tk.Label(
+                self.frame,
+                text=note,
+                bg=T.c("bg"),
+                fg=T.c("text_faint"),
+                font=T.font("caption"),
+                justify="left",
+                anchor="w",
+                wraplength=self._content_w,
+            ).pack(fill="x", padx=self._inset, pady=(0, T.SPACE["sm"]))
         tiles = msg["tiles"]
         # 卡片是一组:卡与卡之间用 sm(挨着才像一组),整组结束后才轮到消息间距。
         for i, (b64, hit) in enumerate(tiles, 1):
@@ -1533,7 +1597,65 @@ class App:
         tiles = history_tiles(item)
         if tiles:
             self._append({"kind": "citations", "tiles": tiles})
+        elif (item.get("question") or "").strip():
+            # 这条记录里没有引用页(存引用页的功能上线前留下的老记录,或者检索成功
+            # 但没走完生成的那一轮)。按原问题补跑一次检索,别让引用卡片就这么空着。
+            self._refetch_refs(item)
         self._scroll_bottom(True)
+
+    def _refetch_refs(self, item: dict):
+        """给没存下引用页的记录补一次检索,把引用卡片补齐。
+
+        只问本地检索服务,没有模型调用,所以打开旧问答依然是"不花一分钱"。补到的页
+        写回历史,下次点开直接就有;补不到就明说没补到 —— 空着不吭声会让人以为
+        这条记录本来就没有引用。
+        """
+        if self._refetching or not (item.get("question") or "").strip():
+            return
+        if not self._serve_ready:
+            self._add_note("这条记录当初没有存下引用页,当前检索服务未就绪,没法补齐。")
+            return
+        self._refetching = True
+        question = item["question"]
+        self._start_loading("正在补齐这条记录的引用页")
+
+        def work():
+            try:
+                hits = search(question)["results"][0]["hits"]
+            except Exception:
+                hits = []
+            self.root.after(0, lambda: apply(hits))
+
+        def apply(hits: list):
+            self._refetching = False
+            self._stop_loading()
+            tiles = tiles_from(hits)
+            if tiles:
+                # 数据先写回历史:"这条记录引用过哪几页"是跟这条记录有关的事实,
+                # 与用户此刻正在看哪一条无关。补到一次就存下来,下次点开不用再查。
+                self.history.update(
+                    item, hits=len(tiles), refs=refs_of([h for _b64, h in tiles])
+                )
+                self._refresh_sidebar()
+            # 这期间用户可能已经点开别的记录、或者又问了一轮 —— 内容就别往新对话里塞
+            if self._current_hist is not item:
+                return
+            if not tiles:
+                self._add_note(
+                    "这条记录当初没有存下引用页,刚按原问题补检索也没拿到截图。"
+                    "「重问」可以重新生成完整的一轮。"
+                )
+                return
+            self._append(
+                {
+                    "kind": "citations",
+                    "tiles": tiles,
+                    "note": "这条记录当初没有存下引用页。以下是按原问题重新检索到的"
+                    "页面,未必是当时那几页;要还原当时那一轮请点「重问」。",
+                }
+            )
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _reask(self, question: str):
         """从历史里点一条:填进输入框并直接提问。"""
@@ -1699,20 +1821,23 @@ class App:
         self._generate(text, hits)  # 仍在后台线程,继续生成答案
 
     def _show_results(self, hits: list):
-        """VLM 不可用时的降级:只展示检索到的引用卡片。"""
-        seen, tiles = set(), []
-        for h in sorted(hits, key=lambda x: float(x.get("score", 0.0)), reverse=True):
-            key = (h.get("article_id"), h.get("tile_index"), h.get("chunk_index"))
-            if key in seen:
-                continue
-            seen.add(key)
-            b64 = h.get("image_base64")
-            if b64:
-                tiles.append((b64, h))
+        """VLM 不可用时的降级:只展示检索到的引用卡片。
+
+        顺带把这轮检索到的页记进历史。这一轮没有答案,但"引用过哪几页"是检索的
+        结果、和答案不是一回事,不该跟着答案一起丢 —— 否则回头点开这条记录,
+        侧栏写着「未完成」、引用卡片一张也不剩。
+        """
+        tiles = tiles_from(hits)
         if tiles:
             self._append({"kind": "citations", "tiles": tiles})
         else:
             self._add_note("没有可显示的截图。")
+        self.history.update(
+            self._hist_entry,
+            hits=len(tiles),
+            refs=refs_of([h for _b64, h in tiles]),
+        )
+        self._refresh_sidebar()
 
     def _generate(self, text: str, hits: list):
         """准备截图 → 调 VLM 流式生成 → 前端流式显示答案 + 引用卡片。运行于后台线程。"""
@@ -1860,16 +1985,7 @@ class App:
             self._hist_entry,
             hits=len(images),
             answer=(msg or {}).get("text", ""),
-            refs=[
-                {
-                    "article_id": h.get("article_id"),
-                    "tile_index": h.get("tile_index"),
-                    "chunk_index": h.get("chunk_index"),
-                    "score": h.get("score"),
-                    "url": h.get("url"),
-                }
-                for _b64, h in images
-            ],
+            refs=refs_of([h for _b64, h in images]),
         )
         self._refresh_sidebar()
 
