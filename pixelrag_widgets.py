@@ -66,8 +66,41 @@ def pil_font(size_px: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 
 
 def font_px(token: str) -> int:
-    """把主题里的点值字号换算成像素(96dpi:px = pt * 4/3),已含 FONT_SCALE。"""
-    return max(10, round(T.pt(token) * 4 / 3))
+    """把主题里的点值字号换算成像素,已含 FONT_SCALE。
+
+    换算系数必须用 tk 自己的(实测 DPI),不能按 96dpi 写死 4/3 —— 在 150% 缩放的屏上
+    那会让 Pillow 画的字比同一 token 的 tk 文字小 31%(用户气泡/按钮长期偏小就是这原因)。
+    """
+    return max(1, round(T.pt(token) * T.tk_scaling()))
+
+
+def line_gap_px(token: str, bold: bool = False) -> int:
+    """Pillow 侧的行距补偿:目标行盒(``T.line_box_px``)减去字体自然行高。
+
+    Pillow 的 ``getmetrics()`` 给出的是字体自身的 asc+desc(tk 的 ``linespace`` 同理),
+    单倍行高约等于字号的 1.29 倍;要凑到 1.6 倍,补的就是这个差值。行高是"目标 - 实测",
+    所以换字体、改 FONT_SCALE、换 DPI 都不用回来改这里的数字。
+    """
+    font = pil_font(font_px(token), bold=bold or T.TYPE[token][1] == "bold")
+    asc, desc = font.getmetrics()
+    return max(0, T.line_box_px(token) - (asc + desc))
+
+
+def tk_line_gap_px(font: tuple) -> int:
+    """tk 侧的同一个补偿量(送给 Text 的 ``spacing2``)。
+
+    tk 的字体元组只给点值,物理字号 = 点值 × ``tk_scaling()`` —— 拿它算目标行盒,
+    再用 ``linespace`` 量字体自然行高,两边相减即可。这样即使传进来的是等宽字体
+    (代码块)也算得对,不需要知道 token 名。
+    """
+    try:
+        f = tkfont.Font(font=font)
+        natural = int(f.metrics("linespace") or 0)
+        size_px = abs(int(f.actual("size"))) * T.tk_scaling()
+    except Exception:
+        return 0
+    target = round(size_px * T.LINE_HEIGHT)
+    return max(0, target - natural)
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +197,18 @@ def render_label_box(
     max_w: int | None = None,
     outline: str | None = None,
     align: str = "left",
-    line_gap: int = 5,
+    line_gap: int | None = None,
     bold: bool = False,
 ) -> Image.Image:
-    """把文本渲染成一张图片。``max_w=None`` 表示不折行(按钮用)。"""
-    font = pil_font(font_px(font_token), bold=bold or T.TYPE[font_token][1] == "bold")
+    """把文本渲染成一张图片。``max_w=None`` 表示不折行(按钮用)。
+
+    ``line_gap=None`` 时按主题行高(``T.LINE_HEIGHT``)自动算,多行文本才有区别 ——
+    单行时上下各减一次,最终高度与 line_gap 无关,所以按钮不会因此变胖。
+    """
+    bold = bold or T.TYPE[font_token][1] == "bold"
+    if line_gap is None:
+        line_gap = line_gap_px(font_token, bold=bold)
+    font = pil_font(font_px(font_token), bold=bold)
     scratch = ImageDraw.Draw(Image.new("RGB", (1, 1)))
 
     if max_w is None:
@@ -360,14 +400,41 @@ def selectable_text(
     fg: str,
     pad_x: int = 0,
     pad_y: int = 0,
-    line_gap: int = 2,
+    line_gap: int | None = None,
 ) -> tk.Text:
     """建一个只读但可选、可复制的正文 Text。
 
     tk.Label 无法选中文字,所以"输出内容要能复制"只能靠 Text 承载。这里不用
     ``state="disabled"``(禁用态在 Windows 上会吃掉一部分选择/复制交互),而是
     保持 normal 并在按键层拦截编辑,行为更接近网页上的只读文本。
+
+    行距按主题行高(``T.LINE_HEIGHT``)铺开,``line_gap=None`` 时自动算。
+
+    tk 的三个 spacing 语义各不相同,而 ``spacing2``(段内折行)会被 tk **上下对半
+    分配**给折点两侧 —— 实测的每行行盒是:
+
+    ===================== ==========================================
+    行的位置                实际行盒
+    ===================== ==========================================
+    单行段落               linespace + spacing1 + spacing3
+    多行段落的段首行        linespace + spacing1 + floor(spacing2/2)
+    多行段落的中间/段末行    linespace + ceil(spacing2/2) + …
+    硬换行(``\\n``)后那行    linespace + spacing3 + spacing1
+    ===================== ==========================================
+
+    要把这些**全部**拉到同一个行盒 ``linespace + gap``,只有一组解:
+    ``spacing1 = ceil(gap/2)``、``spacing2 = gap``、``spacing3 = floor(gap/2)``。
+    随手写成 ``spacing1=0, spacing2=spacing3=gap`` 会让段首行矮 4px、段末行矮 3px,
+    整段看着忽紧忽松 —— ``linecheck.py`` 就是钉这个的(断言每行行盒完全相等)。
+
+    顺带:单行段落的行盒 = linespace + spacing1 + spacing3 正好也是 ``fit_height``
+    折算 ``-height`` 用的基准,所以行距一改控件高度自动跟上。段与段之间的空档由
+    正文里的空行承担(空行本身也是一个"单行段落")。
     """
+    if line_gap is None:
+        line_gap = tk_line_gap_px(font)
+    half_hi = -(-line_gap // 2)  # ceil:折点上半
+    half_lo = line_gap // 2  # floor:折点下半
     txt = tk.Text(
         parent,
         bg=bg,
@@ -380,8 +447,9 @@ def selectable_text(
         height=1,
         padx=pad_x,
         pady=pad_y,
-        spacing1=line_gap,
-        spacing3=line_gap,
+        spacing1=half_hi,
+        spacing2=line_gap,
+        spacing3=half_lo,
         cursor="xterm",
         insertwidth=0,
         takefocus=1,

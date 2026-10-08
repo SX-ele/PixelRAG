@@ -334,6 +334,7 @@ class App:
         self._serve_ready = check_health()
         self._titles = _load_titles()
         self._content_w = T.CONTENT_MAX_WIDTH
+        self._inset = T.SPACE["xl"]  # 消息列到画布边的留白(宽屏时变大,见 _content_metrics)
         self._canvas_w = 0
 
         self._apply_window_geometry()
@@ -565,15 +566,26 @@ class App:
     def _on_frame_configure(self, _e=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
+    def _content_metrics(self, canvas_w: int) -> tuple[int, int]:
+        """消息列的 ``(列宽, 左右留白)``。
+
+        DeepSeek 的正文是一条居中的窄栏:列宽封顶 ``CONTENT_MAX_WIDTH``,窗口再宽也
+        不变宽,多出来的宽度两边均分。窗口窄的时候留白退回 ``SPACE["xl"]``(此时
+        列宽本身就等于可用宽度,没有富余可分)。
+        """
+        avail = max(1, canvas_w - 2 * T.SPACE["xl"])
+        w = max(280, min(T.CONTENT_MAX_WIDTH, avail))
+        return w, max(T.SPACE["xl"], (canvas_w - w) // 2)
+
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self._win, width=event.width)
-        new_w = max(280, min(T.CONTENT_MAX_WIDTH, event.width - 2 * T.SPACE["xl"]))
-        # 画布宽变了也要重排(即使 _content_w 已到上限):正文的左右内缩量是按
-        # 画布宽算的,不重排的话首次拿到真实宽度后行宽会一直偏宽。
+        new_w, new_inset = self._content_metrics(event.width)
+        # 画布宽变了也要重排(即使 _content_w 已到上限):两侧留白是按画布宽算的,
+        # 不重排的话窗口一宽正文就一直贴在左边,和居中的引用卡片对不齐。
         moved = abs(event.width - self._canvas_w) > 8
         self._canvas_w = event.width
-        if abs(new_w - self._content_w) > 8 or moved:
-            self._content_w = new_w
+        if abs(new_w - self._content_w) > 8 or abs(new_inset - self._inset) > 8 or moved:
+            self._content_w, self._inset = new_w, new_inset
             self._schedule_reflow()
 
     def _schedule_reflow(self):
@@ -652,6 +664,11 @@ class App:
         self._photos.clear()
         self._answer_text = None
 
+        # 每条消息只带"下边距 = SPACE['msg']"(消息间距只有这一个来源),所以最上面
+        # 那条前面得补一份上留白,否则会被画布顶边贴住。
+        if self.messages:
+            tk.Frame(self.frame, bg=T.c("bg"), height=T.SPACE["msg"]).pack(fill="x")
+
         for msg in self.messages:
             self._render_message(msg)
         if was_loading:
@@ -687,7 +704,7 @@ class App:
 
     def _render_welcome(self, msg: dict):
         wrap = tk.Frame(self.frame, bg=T.c("bg"))
-        wrap.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["2xl"], T.SPACE["lg"]))
+        wrap.pack(fill="x", padx=self._inset, pady=(T.SPACE["2xl"], T.SPACE["lg"]))
         tk.Label(
             wrap,
             text=msg["text"],
@@ -700,7 +717,7 @@ class App:
 
     def _render_user(self, msg: dict):
         row = tk.Frame(self.frame, bg=T.c("bg"))
-        row.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["xs"]))
+        row.pack(fill="x", padx=self._inset, pady=(0, T.SPACE["msg"]))
         img = W.render_label_box(
             msg["text"],
             "bubble",
@@ -728,11 +745,11 @@ class App:
             justify="left",
             anchor="w",
             wraplength=self._content_w,
-        ).pack(fill="x", padx=T.SPACE["xl"], pady=T.SPACE["xs"])
+        ).pack(fill="x", padx=self._inset, pady=(0, T.SPACE["msg"]))
 
     def _render_error(self, msg: dict):
         row = tk.Frame(self.frame, bg=T.c("bg"))
-        row.pack(fill="x", padx=T.SPACE["xl"], pady=T.SPACE["sm"])
+        row.pack(fill="x", padx=self._inset, pady=(0, T.SPACE["msg"]))
         img = W.render_label_box(
             msg["text"],
             "body",
@@ -785,7 +802,9 @@ class App:
 
     def _render_section(self, text: str):
         wrap = tk.Frame(self.frame, bg=T.c("bg"))
-        wrap.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["sm"]))
+        # 区块标题属于它上面那条消息的一部分,所以贴着上面走(上边距 0),只留
+        # 下边距 —— 它的"和上一条消息的距离"由上面那条的 msg 边距提供。
+        wrap.pack(fill="x", padx=self._inset, pady=(0, T.SPACE["sm"]))
         tk.Label(
             wrap,
             text=text,
@@ -803,22 +822,18 @@ class App:
 
     def _render_answer(self, msg: dict):
         container = tk.Frame(self.frame, bg=T.c("bg"))
-        container.pack(
-            fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["xs"], T.SPACE["sm"])
-        )
+        container.pack(fill="x", padx=self._inset, pady=(0, T.SPACE["msg"]))
         msg["_widget"] = container
 
         # 正文用只读 Text 而不是 Label —— Label 不能选中,复制不出来。
-        # Text 没有 wraplength,只能靠左右内缩把行宽压回 _content_w,
+        # Text 没有 wraplength,行宽靠容器的 padx=self._inset 压回 _content_w,
         # 否则窗口一宽,长行就会横贯整个画布(和引用卡片对不齐)。
-        avail = max(1, self.canvas.winfo_width() - 2 * T.SPACE["xl"])
-        inset = max(0, (avail - self._content_w) // 2)
         txt = W.selectable_text(container, T.font("answer"), T.c("bg"), T.c("text"))
-        txt.pack(fill="x", padx=(inset, inset))
+        txt.pack(fill="x")
         W.attach_text_menu(txt, self.root)
         txt.tag_configure(
             "code",
-            font=T.font_mono(9),
+            font=T.font_mono(14),
             background=T.c("code_bg"),
             lmargin1=T.SPACE["md"],
             lmargin2=T.SPACE["md"],
@@ -884,10 +899,12 @@ class App:
 
     def _render_citations(self, msg: dict):
         self._render_section("引用来源")
-        for i, (b64, hit) in enumerate(msg["tiles"], 1):
-            self._render_citation_card(b64, hit, i)
+        tiles = msg["tiles"]
+        # 卡片是一组:卡与卡之间用 sm(挨着才像一组),整组结束后才轮到消息间距。
+        for i, (b64, hit) in enumerate(tiles, 1):
+            self._render_citation_card(b64, hit, i, last=(i == len(tiles)))
 
-    def _render_citation_card(self, b64: str, hit: dict, idx: int):
+    def _render_citation_card(self, b64: str, hit: dict, idx: int, last: bool = True):
         """白底描边卡片:缩略图 + 标题 + 页码/相似度。点缩略图看大图,点其余开 PDF。"""
         pad = T.SPACE["md"]
         w = max(240, self._content_w)
@@ -902,7 +919,11 @@ class App:
             bd=0,
             cursor="hand2",
         )
-        card.pack(fill="x", padx=T.SPACE["xl"], pady=(0, T.SPACE["sm"]))
+        card.pack(
+            fill="x",
+            padx=self._inset,
+            pady=(0, T.SPACE["msg"] if last else T.SPACE["sm"]),
+        )
 
         title = self._titles.get(hit.get("article_id")) or title_of(hit.get("url", ""))
         x = pad
@@ -1063,7 +1084,7 @@ class App:
         self._loading_base = text
         self._loading_frame = tk.Frame(self.frame, bg=T.c("bg"))
         self._loading_frame.pack(
-            fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["sm"])
+            fill="x", padx=self._inset, pady=(0, T.SPACE["msg"])
         )
         self._loading_label = tk.Label(
             self._loading_frame,

@@ -1,4 +1,4 @@
-"""PixelRAG 桌面客户端设计令牌 —— 方向 A「Notion 纸感」。
+"""PixelRAG 桌面客户端设计令牌 —— 对齐 DeepSeek 聊天界面。
 
 这是全项目唯一的"样式表"。所有颜色 / 字号 / 间距 / 圆角 / 动效时长都必须
 从这里取,业务代码里不允许再出现硬编码色值或魔法数字。
@@ -18,58 +18,65 @@ PALETTES: dict[str, dict[str, str]] = {
     # ---- 浅色:Notion 纸感(默认)----
     "light": {
         "bg": "#FFFFFF",  # 页面底色
-        "surface": "#F7F7F5",  # 侧栏 / 顶栏 / 底栏
+        "surface": "#F9F9F9",  # 侧栏 / 顶栏 / 底栏(DeepSeek 冷灰)
         "card": "#FFFFFF",  # 卡片表面
-        "card_hover": "#FAFAF9",  # 卡片 hover
-        "border": "#E9E9E7",  # 常规分隔线
-        "border_strong": "#D3D1CB",  # hover / focus 时的边框
-        "text": "#37352F",  # 正文(14.9:1 on bg)
-        "text_muted": "#6B6A67",  # 次要信息(5.4:1 on bg)
-        "text_faint": "#767571",  # 极淡提示(4.6:1 on bg)
-        "accent": "#1A73CC",  # 主色(4.8:1 on bg;白字落其上同为 4.8:1)
-        "accent_hover": "#155FB0",
-        "accent_soft": "#E7F1FB",  # 主色淡底(hover 态底,非正文底)
+        "card_hover": "#F5F6F8",  # 卡片 hover
+        "border": "#E5E7EB",  # 常规分隔线
+        "border_strong": "#D1D5DB",  # hover / focus 时的边框
+        "text": "#1F2329",  # 正文(15.8:1 on bg)
+        "text_muted": "#4B5563",  # 次要信息(7.6:1 on bg)
+        "text_faint": "#6B7280",  # 极淡提示(4.8:1 on bg;再淡就跌破 4.5)
+        # 主色拆两个键:填充/边框用原值,白底上的**文字**用 accent_text。
+        # #4D6BFE 落白底只有 4.33:1,不够正文级的 4.5:1,所以文字另取 #3D5AE0(5.6:1)。
+        "accent": "#4D6BFE",  # DeepSeek 蓝:填充 / 边框 / 焦点环
+        "accent_text": "#3D5AE0",  # 白底上的强调色文字(5.6:1 on bg)
+        "accent_hover": "#3D5AE0",  # 实心按钮 hover(白字落其上 5.6:1)
+        "accent_soft": "#F0F3FF",  # 主色淡底(hover 态底,非正文底)
+        # 实心按钮 = accent 底 + 白字 = 4.33:1,是全表唯一低于 4.5 的组合;
+        # 这是 DeepSeek 自己的做法,按用户指定的原值保留。
         "on_accent": "#FFFFFF",  # 主色之上的文字
-        "user_bubble": "#F1F1EF",  # 用户消息淡灰块
-        "user_text": "#37352F",  # 用户消息文字
-        "code_bg": "#F7F6F3",  # 行内代码 / 代码块底
+        "user_bubble": "#E8EEFF",  # 用户消息浅蓝块(DeepSeek 风格)
+        "user_text": "#1F2329",  # 用户消息文字(13.6:1 on user_bubble)
+        "code_bg": "#F6F7F9",  # 行内代码 / 代码块底
         "success": "#0F7B6C",  # 5.2:1 on bg
         "warning": "#8A6100",  # 5.5:1 on bg
         "danger": "#C0392B",  # 5.0:1 on danger_bg
-        "danger_bg": "#FDF2F2",  # 错误提示底
+        "danger_bg": "#FEF2F2",  # 错误提示底
         "input_bg": "#FFFFFF",
-        "input_line": "#E9E9E7",  # 输入框底部 1px 线(未聚焦)
-        "focus": "#1A73CC",  # 键盘焦点环
-        "scrollbar": "#D3D1CB",
-        "skeleton": "#F1F1EF",  # 加载骨架
+        "input_line": "#E5E7EB",  # 输入框 1px 边框(未聚焦)
+        "focus": "#4D6BFE",  # 键盘焦点环
+        "scrollbar": "#D1D5DB",
+        "skeleton": "#F1F2F4",  # 加载骨架
     },
-    # ---- 深色:等价反转 ----
+    # ---- 深色:照 DeepSeek 深色模式推的等价反转 ----
     "dark": {
-        "bg": "#191919",
-        "surface": "#202020",
-        "card": "#252525",
-        "card_hover": "#2C2C2C",
-        "border": "#333331",
-        "border_strong": "#4A4A47",
-        "text": "#E6E6E4",
-        "text_muted": "#A8A7A3",
-        "text_faint": "#8F8E8B",
-        "accent": "#5B9BE8",
-        "accent_hover": "#7CB0F0",
-        "accent_soft": "#1E2A3A",
-        "on_accent": "#0F1419",  # 深色底上主色偏亮,配深墨字才够对比(6.4:1)
-        "user_bubble": "#2F2F2E",
-        "user_text": "#E6E6E4",
-        "code_bg": "#202020",
+        "bg": "#1A1A1A",
+        "surface": "#1E1E1E",
+        "card": "#242424",
+        "card_hover": "#2A2A2A",
+        "border": "#333333",
+        "border_strong": "#454545",
+        "text": "#E8E8E8",  # 14.2:1 on bg
+        "text_muted": "#B4B4BB",
+        "text_faint": "#A1A1AA",  # 6.8:1 on bg
+        # 深色底上主色要提亮才够对比;同样拆成"填充用 / 文字用"两个键。
+        "accent": "#7C93FF",  # 6.2:1 on bg
+        "accent_text": "#8FA4FF",  # 7.4:1 on bg
+        "accent_hover": "#8FA4FF",
+        "accent_soft": "#232B45",
+        "on_accent": "#1A1A1A",  # 深色底上主色偏亮,配深墨字才够对比(6.2:1)
+        "user_bubble": "#253052",  # 深色下的用户气泡:深蓝而非深灰
+        "user_text": "#E8E8E8",  # 10.2:1 on user_bubble
+        "code_bg": "#242424",
         "success": "#4ADE80",
         "warning": "#FACC15",
         "danger": "#F87171",
         "danger_bg": "#3A1D1D",
-        "input_bg": "#202020",
-        "input_line": "#333331",
-        "focus": "#5B9BE8",
-        "scrollbar": "#4A4A47",
-        "skeleton": "#2F2F2E",
+        "input_bg": "#1E1E1E",
+        "input_line": "#333333",
+        "focus": "#7C93FF",
+        "scrollbar": "#4A4A4A",
+        "skeleton": "#2A2A2A",
     },
 }
 
@@ -110,54 +117,99 @@ def c(key: str) -> str:
 FONT_FAMILY = "Microsoft YaHei UI"  # 中文优先;缺失时 tk 会自行回退
 FONT_MONO = "Consolas"
 
-# token -> (字号 pt, 字重)。方向 A 的层级:20 / 16 / 15 / 14 / 12 / 11 px,
-# 换算成 tk 的点值并整体略放大以保证中文可读性。
+# token -> (字号 px, 字重)。**这里存的是 CSS 语义的像素值**,直接照 DeepSeek 的规格写,
+# 肉眼可比。tk 只认点值,由 pt() 换算;Pillow 那边再从 pt() 换回像素,两边严格同源。
+#
+# DeepSeek 的层级:正文统一 16(提问与答案同号,只靠蓝色气泡区分),
+# 标题 20 / 16 / 14 / 12,界面文字最小 12。
 TYPE: dict[str, tuple[int, str]] = {
-    "title": (15, "bold"),  # 顶栏标题
-    "h2": (12, "bold"),  # 区块标题 / 引用来源
-    "body": (11, "normal"),  # 正文(欢迎语 / 提示 / 错误)
-    "body_lg": (12, "normal"),  # 大号正文
-    "bubble": (13, "normal"),  # 用户提问气泡:比正文大一号,一眼能认出"我问的"
-    "answer": (10, "normal"),  # 答案正文:读长文,比正文收一号
-    "input": (10, "normal"),  # 输入框
-    "side": (10, "normal"),  # 侧栏条目:导航文字要退到正文后面,别抢阅读焦点
-    "label": (11, "bold"),  # 卡片标题
-    "button": (11, "bold"),  # 按钮
-    "caption": (9, "normal"),  # 卡片元信息
-    "micro": (8, "normal"),  # 角标
+    "title": (20, "bold"),  # 顶栏品牌
+    "h2": (16, "bold"),  # 区块标题 / 引用来源
+    "body": (16, "normal"),  # 正文(欢迎语 / 提示 / 错误)
+    "body_lg": (16, "normal"),  # 大号正文(保留键;DeepSeek 正文统一 16,暂与 body 同)
+    "bubble": (16, "normal"),  # 用户提问气泡
+    "answer": (16, "normal"),  # 答案正文
+    "input": (16, "normal"),  # 输入框
+    "side": (14, "normal"),  # 侧栏条目
+    "label": (14, "bold"),  # 卡片标题
+    "button": (14, "bold"),  # 按钮
+    "caption": (12, "normal"),  # 卡片元信息
+    "micro": (12, "normal"),  # 角标
 }
 
 
-# 全局字号倍率:**嫌字小就调大这一个数**(1.15 ≈ 正文 11→12.6pt、标题 15→17pt)。
+# 全局字号倍率:**嫌字小就调大这一个数**。1.0 = 上面那套 DeepSeek 原值。
 # tk 绘制与 Pillow 离屏绘制都从这里换算,保证两边的字一样大。
-FONT_SCALE = 1.15
+FONT_SCALE = 1.0
+
+# 96dpi 下 1px = 0.75pt(CSS 的 px 与物理点的换算基准)。
+PX_PER_PT = 0.75
 
 
 def pt(token: str) -> int:
-    """取某个 token 的实际字号(点值,已乘 FONT_SCALE)。
-
-    tk 的字体元组只接受整数点值,所以在这里就取整;Pillow 那边也从这里换算,
-    保证界面上两种绘制方式的字一样大。
-    """
-    return max(1, round(TYPE[token][0] * FONT_SCALE))
+    """取某个 token 的点值(tk 字体元组只接受整数,所以在这里取整)。"""
+    return max(1, round(TYPE[token][0] * PX_PER_PT * FONT_SCALE))
 
 
 def font(token: str) -> tuple:
-    """取 tk 字体元组,如 ('Microsoft YaHei UI', 12.6, 'normal')。"""
+    """取 tk 字体元组,如 ('Microsoft YaHei UI', 12, 'normal')。"""
     return (FONT_FAMILY, pt(token), TYPE[token][1])
 
 
-def font_mono(size: int = 10) -> tuple:
-    """等宽字体(代码块)。``size`` 是设计字号,同样会乘 FONT_SCALE。"""
-    return (FONT_MONO, max(1, round(size * FONT_SCALE)), "normal")
+def font_mono(size: int = 14) -> tuple:
+    """等宽字体(代码块)。``size`` 是设计像素值。"""
+    return (FONT_MONO, max(1, round(size * PX_PER_PT * FONT_SCALE)), "normal")
+
+
+# 行高倍数:DeepSeek 正文 16px / 行高 1.6。tk 与 Pillow 两边都从这里取,所以屏幕上
+# 的正文和离屏画出来的气泡行距完全一致(改行距只动这一个数)。
+LINE_HEIGHT = 1.6
+
+
+def px_size(token: str) -> int:
+    """该 token 的字号,设计像素(含 FONT_SCALE)。"""
+    return max(1, round(TYPE[token][0] * FONT_SCALE))
+
+
+def line_box_px(token: str) -> int:
+    """该 token 一行该占多高(物理像素)= 字号 × 行高 × 屏幕缩放。
+
+    注意这里含 ``UI_SCALE``:字号走 tk 的 pt→px 换算后实际就是放大了 UI_SCALE 倍,
+    行盒必须用同一把尺子,否则高分屏上行距会显得比字紧。
+    """
+    return max(1, round(px_size(token) * LINE_HEIGHT * UI_SCALE))
+
+
+# tk 把点值换算成像素的系数。**必须实测,不能按 96dpi 猜成 4/3** —— 本机是 150% 缩放
+# (tk scaling ≈ 1.93),猜 4/3 会让 Pillow 画出来的字比 tk 那边小 31%,也就是用户气泡
+# 和所有按钮的字一直偏小。这里问一次 tk 再缓存,调用方无需关心。
+_TK_SCALING: float | None = None
+
+
+def tk_scaling() -> float:
+    """tk 的点值→像素系数(需要已存在 Tk 根窗口;没有就回退到 96dpi)。"""
+    global _TK_SCALING
+    if _TK_SCALING is None:
+        try:
+            import tkinter
+
+            root = tkinter._default_root
+            _TK_SCALING = (
+                float(root.winfo_fpixels("1i")) / 72 if root else 1 / PX_PER_PT
+            )
+        except Exception:
+            _TK_SCALING = 1 / PX_PER_PT  # 拿不到就退回 96dpi,至少不比以前差
+    return _TK_SCALING
 
 
 # ---------------------------------------------------------------------------
 # 间距(4px 基准) / 圆角 / 动效
 # ---------------------------------------------------------------------------
-_BASE_SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "2xl": 32}
+_BASE_SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "2xl": 32, "msg": 24}
 _BASE_RADIUS = {"sm": 6, "md": 8, "lg": 12}
-_BASE_CONTENT_MAX_WIDTH = 720
+# 消息列的宽度上限(DeepSeek 是 768)。窗口再宽也不跟着变宽 —— 富余的宽度均分成
+# 两侧留白,正文始终是一条居中的窄栏,长行才不会横贯整屏。
+_BASE_CONTENT_MAX_WIDTH = 768
 
 # 下面三个是"逻辑值 × UI_SCALE"的结果;启动时由 set_ui_scale 按屏幕 DPI 重算,
 # 以便在高分屏上字变大的同时,内边距/圆角/行宽等比跟上,不会显得局促。
@@ -186,6 +238,3 @@ MOTION: dict[str, int] = {
     "stream_throttle": 60,  # 流式重绘节流间隔
     "resize_debounce": 120,  # 窗口尺寸变化防抖
 }
-
-# 正文最大宽度(px):超过则两侧留白,保证长文阅读行宽舒适
-CONTENT_MAX_WIDTH = 720
