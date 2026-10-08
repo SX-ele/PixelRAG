@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""PixelRAG 知识库桌面客户端(DeepSeek 风格深色聊天界面)。
+"""PixelRAG 知识库桌面客户端 —— 「Notion 纸感」浅色聊天界面。
 
-打开即自动检测/启动检索服务,支持中文或英文查询,返回最相关的论文页面
-(标题 + 相似度 + 页面截图),点击标题打开论文 PDF,点击截图看大图。
+打开即自动检测/启动检索服务,输入问题后检索最相关的论文页面截图,交给视觉模型
+流式生成答案,正文下方附引用卡片(文件名 / 页码 / 缩略图 / 点击打开 PDF)。
+顶栏可切换深色主题。
 
-依赖:仅标准库 tkinter + 已安装的 Pillow,无需额外安装。
+界面样式全部取自 ``pixelrag_theme`` 的设计令牌;tkinter 缺失的圆角、hover 等能力
+由 ``pixelrag_widgets`` 用 Pillow 离屏渲染补齐。检索与生成逻辑与旧版一致。
+
+依赖:标准库 tkinter + 已安装的 Pillow、anthropic。
 """
+
 import base64
 import io
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -19,40 +25,38 @@ import urllib.request
 import anthropic
 from PIL import Image, ImageTk
 
+import pixelrag_history as H
+import pixelrag_theme as T
+import pixelrag_widgets as W
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 HOST = "localhost"
 PORT = 30001
 N_DOCS = 5
 HEALTH_URL = f"http://{HOST}:{PORT}/health"
 SEARCH_URL = f"http://{HOST}:{PORT}/search"
+ARTICLES_JSON = os.path.join(ROOT, "knowledge_index", "articles.json")
 
 # ---- VLM 生成配置(DeepSeek-V4.1-Flash,原生视觉)----
-VLM_MODEL = "deepseek-flash"             # DeepSeek-V4.1-Flash 官方主名;旧名 deepseek-v4-flash 已下线
+VLM_MODEL = (
+    "deepseek-flash"  # DeepSeek-V4.1-Flash 官方主名;旧名 deepseek-v4-flash 已下线
+)
 VLM_BASE_URL = "https://api.deepseek.com/anthropic"
-VLM_MAX_IMAGES = 6                        # 最多发几张截图
-VLM_MAX_SIDE = 1568                       # 截图长边像素上限(超出即压缩)
-VLM_MAX_TOKENS = 2048
+VLM_MAX_IMAGES = 6  # 最多发几张截图
+VLM_MAX_SIDE = 1568  # 截图长边像素上限(超出即压缩)
+# 输出上限。注意:deepseek-flash 是带思考的模型,思考 token 也计入这里 ——
+# 图多、问题复杂时思考轻松吃掉 2000+,上限太小会导致"一个字都没写就被切断"
+# (界面表现就是"模型没有返回任何内容")。实测 8192 能稳定作答。
+VLM_MAX_TOKENS = 8192
 
-# ---- 配色(参考 DeepSeek 深色主题)----
-BG = "#1f1f1f"        # 主背景
-BAR_BG = "#141414"    # 顶栏/底栏背景
-CARD_BG = "#2a2a2a"   # 结果卡片背景
-USER_BG = "#4d6bfe"   # 用户气泡(蓝)
-USER_FG = "#ffffff"
-TEXT_FG = "#e6e6e6"   # 主文字
-MUTED_FG = "#9e9e9e"  # 次要文字
-ACCENT = "#7a9bff"    # 可点击标题
-BORDER = "#3a3a3a"
-GREEN = "#4ade80"     # 服务运行中
-YELLOW = "#facc15"    # 启动中
-RED = "#f87171"       # 失败
-
-FONT = "Microsoft YaHei UI"
+# 窗口逻辑尺寸(会按屏幕 DPI 缩放)
+WIN_W, WIN_H = 900, 780
 
 
 # ---------------------------------------------------------------------------
-# 服务与检索
+# 服务与检索(与旧版一致,未改动)
 # ---------------------------------------------------------------------------
+
 
 def check_health() -> bool:
     try:
@@ -65,12 +69,18 @@ def check_health() -> bool:
 def _serve_cmd() -> list[str]:
     exe = os.path.join(ROOT, ".venv", "Scripts", "pixelrag.exe")
     return [
-        exe, "serve",
-        "--index-dir", os.path.join(ROOT, "knowledge_index"),
-        "--tiles-dir", os.path.join(ROOT, "knowledge_index", "tiles"),
-        "--articles-json", os.path.join(ROOT, "knowledge_index", "articles.json"),
-        "--device", "cpu",
-        "--port", str(PORT),
+        exe,
+        "serve",
+        "--index-dir",
+        os.path.join(ROOT, "knowledge_index"),
+        "--tiles-dir",
+        os.path.join(ROOT, "knowledge_index", "tiles"),
+        "--articles-json",
+        os.path.join(ROOT, "knowledge_index", "articles.json"),
+        "--device",
+        "cpu",
+        "--port",
+        str(PORT),
     ]
 
 
@@ -80,8 +90,11 @@ def start_serve_process() -> subprocess.Popen:
     env["TRANSFORMERS_OFFLINE"] = "1"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.Popen(
-        _serve_cmd(), env=env, creationflags=flags,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        _serve_cmd(),
+        env=env,
+        creationflags=flags,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -90,8 +103,10 @@ def search(text: str, n_docs: int = N_DOCS) -> dict:
         {"queries": [{"text": text}], "n_docs": n_docs, "include_images": True}
     ).encode("utf-8")
     req = urllib.request.Request(
-        SEARCH_URL, data=payload,
-        headers={"Content-Type": "application/json"}, method="POST",
+        SEARCH_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     with urllib.request.urlopen(req, timeout=900) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -108,11 +123,30 @@ def decode_b64_image(b64: str) -> Image.Image:
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
 
+def _load_titles() -> dict[int, str]:
+    """articles.json 的下标即 article_id,用它拿到比文件名更干净的标题。"""
+    try:
+        with open(ARTICLES_JSON, encoding="utf-8") as f:
+            arts = json.load(f)
+        return {i: (a.get("title") or "") for i, a in enumerate(arts)}
+    except Exception:
+        return {}
+
+
+def screen_scale() -> float:
+    try:
+        import ctypes
+
+        return ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+    except Exception:
+        return 1.0
+
+
 SYSTEM_PROMPT = (
     "你是一个科研文献视觉问答助手。用户会提供若干张论文页面的截图,并附上一个问题。"
     "请只根据这些截图中的可见内容回答,严格遵守:\n"
     "1. 只能依据截图内容回答,严禁编造截图里没有的数据或事实。\n"
-    "2. 若截图信息不足以回答,直接说\"根据现有资料无法回答\",不要猜测。\n"
+    '2. 若截图信息不足以回答,直接说"根据现有资料无法回答",不要猜测。\n'
     "3. 回答要具体、简洁,直接给出结论。\n"
     "4. 每个关键事实后用 [1][2] 等编号标注,编号对应第几张截图(从 1 开始)。\n"
     "5. 若答案来自某张图表,说明依据的是第几张图的哪个部分。\n"
@@ -172,17 +206,24 @@ def prepare_images(hits: list, k: int = VLM_MAX_IMAGES) -> list:
 
 
 def vlm_stream(images, question: str, cfg: dict):
-    """把多张截图按相关度顺序 + 问题发给 VLM,流式 yield 答案文本(过滤 thinking)。"""
+    """把多张截图按相关度顺序 + 问题发给 VLM,流式 yield 答案文本(过滤 thinking)。
+
+    两个容易被误判成"网络坏了"的情况在这里说明白:模型把输出额度全花在思考上、
+    一个字都没写出来时,抛一条能看懂的错误,而不是静默返回空串。
+    """
     client = anthropic.Anthropic(api_key=cfg["api_key"], base_url=cfg["base_url"])
     content = []
     for i, (b64, _h) in enumerate(images, 1):
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-        })
+        content.append(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+            }
+        )
         content.append({"type": "text", "text": f"[第{i}张截图]"})
     content.append({"type": "text", "text": question})
 
+    got_text = False
     with client.messages.stream(
         model=cfg["model"],
         max_tokens=VLM_MAX_TOKENS,
@@ -191,187 +232,904 @@ def vlm_stream(images, question: str, cfg: dict):
     ) as stream:
         for ev in stream:
             if getattr(ev, "type", None) == "text":
+                got_text = True
                 yield ev.text
+        stop_reason = getattr(stream.get_final_message(), "stop_reason", None)
+
+    if stop_reason == "max_tokens":
+        if not got_text:
+            raise RuntimeError(
+                f"模型的思考占满了输出上限(max_tokens={VLM_MAX_TOKENS}),"
+                "还没来得及作答就被切断了。请再试一次,或把 pixelrag_client.py 里的 "
+                "VLM_MAX_TOKENS 调得更大。"
+            )
+        yield "\n\n（回答达到长度上限,可能不完整）"
+
+
+_CODE_RE = re.compile(r"```[ \t]*[\w+-]*\n(.*?)```", re.DOTALL)
+
+
+def _split_code_blocks(text: str) -> list[tuple[str, str]]:
+    """把答案切成 ('text'|'code', 片段) 序列,用于分别排版代码块。"""
+    out: list[tuple[str, str]] = []
+    pos = 0
+    for m in _CODE_RE.finditer(text):
+        if m.start() > pos:
+            out.append(("text", text[pos : m.start()]))
+        out.append(("code", m.group(1).rstrip("\n")))
+        pos = m.end()
+    if pos < len(text):
+        out.append(("text", text[pos:]))
+    return out or [("text", text)]
 
 
 # ---------------------------------------------------------------------------
 # 界面
 # ---------------------------------------------------------------------------
 
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PixelRAG 视觉问答")
-        self.root.geometry("880x760")
-        self.root.minsize(640, 560)
-        self.root.configure(bg=BG)
+        root.title("PixelRAG 视觉问答")
+        root.configure(bg=T.c("bg"))
+        root.minsize(int(660 * T.UI_SCALE), int(480 * T.UI_SCALE))
 
+        # 消息数据模型:主题切换 / 窗口缩放时据此重放渲染
+        self.messages: list[dict] = []
         self._photos: list[ImageTk.PhotoImage] = []  # 防止图片被 GC
-        self._serve_ready = check_health()
+        self._answer_text: tk.Text | None = None
+        self._answer_msg: dict | None = None
+        self._paint_job = None
+        self._loading_job = None
+        self._loading_active = False
+        self._loading_base = "正在检索相关页面"
+        self._resize_job = None
+        self._send_hover = False
+        self._stop_hover = False
         self._busy = False
+        # 停止生成:主线程置位,后台消费循环轮询。generator 另存一份是为了能
+        # 显式 close(),让底层的 HTTP 流立刻断开而不是等 GC。
+        self._stop_event = threading.Event()
+        self._gen = None
+        self._stopped = False
+        self._last_question: str | None = None
+        # 查询历史:落盘存储 + 面板 + 输入框上下键召回
+        self.history = H.History()
+        self._history_panel: H.HistoryPanel | None = None
+        self._hist_entry: dict | None = None  # 本次提问对应的历史条目,答完回填
+        self._hist_pos: int | None = None  # None = 不在召回态;0 = 最新一条
+        self._hist_draft = ""  # 召回前用户已经敲了一半的内容
+        self._serve_ready = check_health()
+        self._titles = _load_titles()
+        self._content_w = T.CONTENT_MAX_WIDTH
+        self._canvas_w = 0
 
+        self._apply_window_geometry()
         self._build_ui()
-        self._add_note("欢迎使用 PixelRAG 视觉问答。\n输入问题,回车后检索相关论文页面截图,并由视觉模型生成答案(附引用)。")
+        self._add_welcome()
         self._set_status()
 
         if not self._serve_ready:
             threading.Thread(target=self._ensure_serve, daemon=True).start()
 
+    def _apply_window_geometry(self):
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w = min(int(WIN_W * T.UI_SCALE), sw - int(80 * T.UI_SCALE))
+        h = min(int(WIN_H * T.UI_SCALE), sh - int(120 * T.UI_SCALE))
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 3)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
     # ---------- UI 构建 ----------
 
     def _build_ui(self):
-        # 顶栏状态
-        self.status = tk.Label(
-            self.root, text="", bg=BAR_BG, fg=MUTED_FG, anchor="w",
-            padx=16, pady=7, font=(FONT, 10),
-        )
-        self.status.pack(side="top", fill="x")
+        self._build_topbar()
+        self._build_bottom_bar()
+        self._build_body()
 
-        # 消息区(Canvas + Frame + 滚动条)
-        body = tk.Frame(self.root, bg=BG)
+    def _build_topbar(self):
+        self.topbar = tk.Frame(self.root, bg=T.c("surface"))
+        self.topbar.pack(side="top", fill="x")
+        inner = tk.Frame(self.topbar, bg=T.c("surface"))
+        inner.pack(fill="x", padx=T.SPACE["lg"], pady=T.SPACE["sm"])
+
+        self.brand = tk.Label(
+            inner,
+            text="PixelRAG",
+            bg=T.c("surface"),
+            fg=T.c("text"),
+            font=T.font("title"),
+        )
+        self.brand.pack(side="left")
+        self.brand_sub = tk.Label(
+            inner,
+            text="视觉问答",
+            bg=T.c("surface"),
+            fg=T.c("text_faint"),
+            font=T.font("caption"),
+        )
+        self.brand_sub.pack(
+            side="left", padx=(T.SPACE["sm"], 0), pady=(T.SPACE["xs"], 0)
+        )
+
+        # 主题切换
+        self.theme_btn = tk.Label(
+            inner,
+            text="",
+            bg=T.c("surface"),
+            fg=T.c("text_muted"),
+            font=T.font("caption"),
+            cursor="hand2",
+            padx=T.SPACE["sm"],
+            pady=T.SPACE["xs"],
+        )
+        self.theme_btn.pack(side="right")
+        self.theme_btn.bind("<Button-1>", lambda _e: self._toggle_theme())
+        W.make_focusable(self.theme_btn, T.c("surface"), self._toggle_theme)
+        W.bind_hover(
+            self.theme_btn,
+            on_enter=lambda: self.theme_btn.configure(
+                fg=T.c("accent"), bg=T.c("accent_soft")
+            ),
+            on_leave=lambda: self.theme_btn.configure(
+                fg=T.c("text_muted"), bg=T.c("surface")
+            ),
+        )
+        self._sync_theme_btn()
+
+        # 查询历史
+        self.history_btn = tk.Label(
+            inner,
+            text="历史",
+            bg=T.c("surface"),
+            fg=T.c("text_muted"),
+            font=T.font("caption"),
+            cursor="hand2",
+            padx=T.SPACE["sm"],
+            pady=T.SPACE["xs"],
+        )
+        self.history_btn.pack(side="right", padx=(0, T.SPACE["xs"]))
+        self.history_btn.bind("<Button-1>", lambda _e: self._on_history())
+        W.make_focusable(self.history_btn, T.c("surface"), self._on_history)
+        W.bind_hover(
+            self.history_btn,
+            on_enter=lambda: self.history_btn.configure(
+                fg=T.c("accent"), bg=T.c("accent_soft")
+            ),
+            on_leave=lambda: self.history_btn.configure(
+                fg=T.c("text_muted"), bg=T.c("surface")
+            ),
+        )
+
+        self.status = tk.Label(
+            inner,
+            text="",
+            bg=T.c("surface"),
+            fg=T.c("text_muted"),
+            font=T.font("caption"),
+        )
+        self.status.pack(side="right", padx=(0, T.SPACE["md"]))
+
+        self.topbar_line = tk.Frame(self.root, bg=T.c("border"), height=1)
+        self.topbar_line.pack(side="top", fill="x")
+
+    def _sync_theme_btn(self):
+        text = "切换深色" if T.mode() == "light" else "切换浅色"
+        self.theme_btn.configure(text=text)
+
+    def _build_bottom_bar(self):
+        self.bottom = tk.Frame(self.root, bg=T.c("bg"))
+        self.bottom.pack(side="bottom", fill="x")
+        tk.Frame(self.bottom, bg=T.c("border"), height=1).pack(side="top", fill="x")
+
+        row = tk.Frame(self.bottom, bg=T.c("bg"))
+        row.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["md"], T.SPACE["sm"]))
+
+        # 发送按钮(圆角图片按钮,支持 hover / disabled 两态)
+        self.send_btn = tk.Label(row, bg=T.c("bg"), bd=0, cursor="hand2")
+        self.send_btn.pack(side="right", padx=(T.SPACE["md"], 0), anchor="s")
+        self.send_btn.bind("<Button-1>", lambda _e: self._on_send())
+        W.bind_hover(
+            self.send_btn, on_enter=self._send_hover_on, on_leave=self._send_hover_off
+        )
+        W.make_focusable(self.send_btn, T.c("bg"), self._on_send)
+
+        # 停止按钮:只在生成期间出现,平时不 pack(不占位)
+        self.stop_btn = tk.Label(row, bg=T.c("bg"), bd=0, cursor="hand2")
+        self.stop_btn.bind("<Button-1>", lambda _e: self._on_stop())
+        W.bind_hover(
+            self.stop_btn, on_enter=self._stop_hover_on, on_leave=self._stop_hover_off
+        )
+        W.make_focusable(self.stop_btn, T.c("bg"), self._on_stop)
+        self._stop_shown = False
+
+        # 输入区:底线式,聚焦时底线变强调色
+        box = tk.Frame(row, bg=T.c("bg"))
+        box.pack(side="left", fill="x", expand=True)
+        self.input = tk.Text(
+            box,
+            height=2,
+            bg=T.c("input_bg"),
+            fg=T.c("text"),
+            insertbackground=T.c("accent"),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=T.font("body_lg"),
+            wrap="word",
+            padx=0,
+            pady=0,
+            spacing1=2,
+            spacing3=2,
+        )
+        self.input.pack(fill="x")
+        self.input.bind("<Return>", self._on_enter)
+        self.input.bind("<Escape>", lambda _e: self._clear_input())
+        self.input.bind("<Control-a>", self._select_all_input)
+        # ↑/↓ 召回历史:只在光标处于首行(↑)/已在召回态(↓)时接管,否则让 tk 正常移光标
+        self.input.bind("<Up>", self._on_input_up)
+        self.input.bind("<Down>", self._on_input_down)
+        W.attach_text_menu(self.input, self.root, editable=True)
+        self.input.bind(
+            "<FocusIn>", lambda _e: self.input_line.configure(bg=T.c("accent"))
+        )
+        self.input.bind(
+            "<FocusOut>", lambda _e: self.input_line.configure(bg=T.c("input_line"))
+        )
+        self.input_line = tk.Frame(box, bg=T.c("input_line"), height=1)
+        self.input_line.pack(fill="x", pady=(T.SPACE["sm"], 0))
+
+        hint = tk.Label(
+            self.bottom,
+            text="Enter 发送  ·  Shift+Enter 换行  ·  ↑ 历史  ·  Esc 清空",
+            bg=T.c("bg"),
+            fg=T.c("text_faint"),
+            font=T.font("micro"),
+        )
+        hint.pack(side="top", pady=(0, T.SPACE["sm"]))
+
+    def _build_body(self):
+        body = tk.Frame(self.root, bg=T.c("bg"))
         body.pack(side="top", fill="both", expand=True)
 
-        self.canvas = tk.Canvas(body, bg=BG, highlightthickness=0)
+        self.canvas = tk.Canvas(body, bg=T.c("bg"), highlightthickness=0, bd=0)
         self.scroll = tk.Scrollbar(
-            body, orient="vertical", command=self.canvas.yview,
-            bg=CARD_BG, troughcolor=BG, activebackground=BORDER,
-            borderwidth=0, width=12,
+            body,
+            orient="vertical",
+            command=self.canvas.yview,
+            bg=T.c("scrollbar"),
+            troughcolor=T.c("bg"),
+            activebackground=T.c("border_strong"),
+            borderwidth=0,
+            width=10,
+            relief="flat",
+            elementborderwidth=0,
         )
         self.canvas.configure(yscrollcommand=self.scroll.set)
         self.scroll.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        self.frame = tk.Frame(self.canvas, bg=BG)
+        self.frame = tk.Frame(self.canvas, bg=T.c("bg"))
         self._win = self.canvas.create_window((0, 0), window=self.frame, anchor="nw")
-        self.frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
-        )
-        self.canvas.bind(
-            "<Configure>",
-            lambda e: self.canvas.itemconfigure(self._win, width=e.width),
+        self.frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _on_frame_configure(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self._win, width=event.width)
+        new_w = max(280, min(T.CONTENT_MAX_WIDTH, event.width - 2 * T.SPACE["xl"]))
+        # 画布宽变了也要重排(即使 _content_w 已到上限):正文的左右内缩量是按
+        # 画布宽算的,不重排的话首次拿到真实宽度后行宽会一直偏宽。
+        moved = abs(event.width - self._canvas_w) > 8
+        self._canvas_w = event.width
+        if abs(new_w - self._content_w) > 8 or moved:
+            self._content_w = new_w
+            self._schedule_reflow()
+
+    def _schedule_reflow(self):
+        """窗口尺寸变化后防抖重排(圆角图与折行宽度都需要重算)。"""
+        if self._resize_job:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.root.after(
+            T.MOTION["resize_debounce"], self._render_all
         )
 
-        # 底部输入栏
-        bar = tk.Frame(self.root, bg=BAR_BG)
-        bar.pack(side="bottom", fill="x")
-
-        self.input = tk.Text(
-            bar, height=3, bg=CARD_BG, fg=TEXT_FG, insertbackground=TEXT_FG,
-            relief="flat", font=(FONT, 12), padx=12, pady=10, wrap="word",
-        )
-        self.input.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=12)
-        self.input.bind("<Return>", self._on_enter)
-        self.input.insert("1.0", "")
-        self.input.focus_set()
-
-        self.send_btn = tk.Button(
-            bar, text="发送", command=self._on_send,
-            bg=USER_BG, fg=USER_FG, activebackground="#5a7cff",
-            activeforeground="#ffffff", relief="flat", font=(FONT, 11, "bold"),
-            padx=22, pady=8, cursor="hand2",
-        )
-        self.send_btn.pack(side="right", padx=(0, 16), pady=12)
+    def _on_wheel(self, event):
+        try:
+            self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+        except Exception:
+            pass
 
     # ---------- 状态 ----------
 
     def _set_status(self, state: str | None = None):
         if state == "starting":
-            self.status.configure(text="●  正在启动检索服务...", fg=YELLOW)
+            self.status.configure(text="● 正在启动检索服务", fg=T.c("warning"))
         elif state == "failed":
-            self.status.configure(text="●  服务启动失败(见控制台)", fg=RED)
+            self.status.configure(text="● 服务启动失败(见控制台)", fg=T.c("danger"))
         elif self._serve_ready:
-            self.status.configure(text="●  服务运行中  ·  端口 30001", fg=GREEN)
+            self.status.configure(text="● 服务运行中 · 端口 30001", fg=T.c("success"))
         else:
-            self.status.configure(text="●  服务启动中...", fg=YELLOW)
+            self.status.configure(text="● 服务启动中", fg=T.c("warning"))
 
-    # ---------- 消息渲染 ----------
+    # ---------- 消息模型与渲染 ----------
+
+    def _append(self, msg: dict) -> dict:
+        stick = self._at_bottom()  # 先取状态:追加后必然"不在底部"
+        self.messages.append(msg)
+        self._render_message(msg)
+        self._scroll_bottom(stick)
+        return msg
+
+    def _add_welcome(self):
+        self._append(
+            {
+                "kind": "welcome",
+                "text": "输入问题,我会检索知识库里的论文页面截图,并基于截图内容作答。\n"
+                "答案下方给出引用来源,点击卡片可打开对应的 PDF。",
+            }
+        )
 
     def _add_user(self, text: str):
-        row = tk.Frame(self.frame, bg=BG)
-        row.pack(fill="x", padx=16, pady=(14, 2))
-        lbl = tk.Label(
-            row, text=text, bg=USER_BG, fg=USER_FG, justify="left",
-            wraplength=520, font=(FONT, 12), padx=14, pady=9,
-        )
-        lbl.pack(side="right", anchor="e")
-        self._scroll_bottom()
+        self._append({"kind": "user", "text": text})
 
     def _add_note(self, text: str):
-        lbl = tk.Label(
-            self.frame, text=text, bg=BG, fg=MUTED_FG, justify="center",
-            font=(FONT, 11), padx=16, pady=10,
-        )
-        lbl.pack(fill="x", padx=16)
-        self._scroll_bottom()
+        self._append({"kind": "note", "text": text})
 
-    def _add_error(self, text: str):
-        lbl = tk.Label(
-            self.frame, text=text, bg="#3a1d1d", fg=RED, justify="left",
-            wraplength=700, font=(FONT, 11), padx=14, pady=10,
-        )
-        lbl.pack(fill="x", padx=16, pady=8)
-        self._scroll_bottom()
+    def _add_error(self, text: str, retry: bool = False):
+        """``retry=True`` 时在这条错误下挂一个「重新生成」按钮。"""
+        self._append({"kind": "error", "text": text, "retry": retry})
 
-    def _add_result_card(self, hit: dict, idx: int):
-        card = tk.Frame(
-            self.frame, bg=CARD_BG, highlightthickness=1,
-            highlightbackground=BORDER,
-        )
-        card.pack(fill="x", padx=16, pady=(0, 14))
+    def _render_all(self, view_state: tuple[bool, float] | None = None):
+        """清空并重放全部消息(主题切换 / 窗口尺寸变化时调用)。
 
-        url = hit.get("url", "")
-        title = title_of(url)
-        ti = hit.get("tile_index", 0)
-        score = hit.get("score", 0.0)
+        ``view_state`` 由调用方在重建界面前取得;不传则读当前画布。
+        """
+        self._resize_job = None
+        stick, top = view_state if view_state is not None else self._view_state()
+        was_loading = self._loading_active
+        self._cancel_loading_job()
+        self._loading_active = False
 
-        # 标题(点击打开 PDF)
-        title_lbl = tk.Label(
-            card, text=f"[{idx}]  {title}", bg=CARD_BG, fg=ACCENT,
-            font=(FONT, 11, "bold"), justify="left", anchor="w",
-            wraplength=760, cursor="hand2", padx=14,
-        )
-        title_lbl.pack(fill="x", pady=(12, 2))
-        title_lbl.bind(
-            "<Button-1>",
-            lambda e, u=url: self._open_pdf(u),
-        )
+        for w in self.frame.winfo_children():
+            w.destroy()
+        self._photos.clear()
+        self._answer_text = None
 
-        # 元信息
-        meta = tk.Label(
-            card, text=f"页面 tile_{ti:04d}   ·   相似度 {score:.3f}   ·   点击标题打开 PDF",
-            bg=CARD_BG, fg=MUTED_FG, font=(FONT, 9), anchor="w", padx=14,
-        )
-        meta.pack(fill="x", pady=(0, 8))
+        for msg in self.messages:
+            self._render_message(msg)
+        if was_loading:
+            self._start_loading(self._loading_base)
 
-        # 页面截图缩略图(点击看大图)
-        b64 = hit.get("image_base64")
-        if b64:
+        self.canvas.update_idletasks()  # 让 bbox 反映新内容,否则滚动范围是旧的
+        self._on_frame_configure()
+        try:
+            self.canvas.yview_moveto(1.0 if stick else top)
+        except Exception:
+            pass
+        if stick:
+            self._scroll_bottom(True)  # 几何稳定后再吸一次,避免滚动范围随后变大
+
+    def _render_message(self, msg: dict):
+        kind = msg.get("kind")
+        if kind == "user":
+            self._render_user(msg)
+        elif kind == "welcome":
+            self._render_welcome(msg)
+        elif kind == "note":
+            self._render_note(msg)
+        elif kind == "error":
+            self._render_error(msg)
+        elif kind == "section":
+            self._render_section(msg["text"])
+        elif kind == "answer":
+            self._render_answer(msg)
+        elif kind == "citations":
+            self._render_citations(msg)
+
+    # ---- 各类消息 ----
+
+    def _render_welcome(self, msg: dict):
+        wrap = tk.Frame(self.frame, bg=T.c("bg"))
+        wrap.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["2xl"], T.SPACE["lg"]))
+        tk.Label(
+            wrap,
+            text=msg["text"],
+            bg=T.c("bg"),
+            fg=T.c("text_muted"),
+            font=T.font("body"),
+            justify="center",
+            wraplength=self._content_w - 2 * T.SPACE["md"],
+        ).pack(anchor="center")
+
+    def _render_user(self, msg: dict):
+        row = tk.Frame(self.frame, bg=T.c("bg"))
+        row.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["xs"]))
+        img = W.render_label_box(
+            msg["text"],
+            "body",
+            T.c("user_text"),
+            T.c("bg"),
+            box_fill=T.c("user_bubble"),
+            radius=T.RADIUS["md"],
+            pad_x=T.SPACE["md"],
+            pad_y=T.SPACE["sm"],
+            max_w=int(self._content_w * 0.78),
+        )
+        photo = W.photo_of(img)
+        self._photos.append(photo)
+        lbl = tk.Label(row, image=photo, bg=T.c("bg"), bd=0)
+        lbl.image = photo
+        lbl.pack(side="right")
+
+    def _render_note(self, msg: dict):
+        tk.Label(
+            self.frame,
+            text=msg["text"],
+            bg=T.c("bg"),
+            fg=T.c("text_muted"),
+            font=T.font("body"),
+            justify="left",
+            anchor="w",
+            wraplength=self._content_w,
+        ).pack(fill="x", padx=T.SPACE["xl"], pady=T.SPACE["xs"])
+
+    def _render_error(self, msg: dict):
+        row = tk.Frame(self.frame, bg=T.c("bg"))
+        row.pack(fill="x", padx=T.SPACE["xl"], pady=T.SPACE["sm"])
+        img = W.render_label_box(
+            msg["text"],
+            "body",
+            T.c("danger"),
+            T.c("bg"),
+            box_fill=T.c("danger_bg"),
+            radius=T.RADIUS["md"],
+            pad_x=T.SPACE["md"],
+            pad_y=T.SPACE["sm"],
+            max_w=self._content_w,
+        )
+        photo = W.photo_of(img)
+        self._photos.append(photo)
+        lbl = tk.Label(row, image=photo, bg=T.c("bg"), bd=0)
+        lbl.image = photo
+        lbl.pack(anchor="w")  # 竖排:气泡在上,重试按钮在下
+        if msg.get("retry"):
+            self._render_retry_button(row)
+
+    def _render_retry_button(self, parent):
+        """次要按钮:描边胶囊,悬停变主色。"""
+        btn = tk.Label(parent, bg=T.c("bg"), bd=0, cursor="hand2")
+        btn.pack(anchor="w", pady=(T.SPACE["sm"], 0))
+
+        def paint(hover: bool):
+            img = W.render_label_box(
+                "重新生成",
+                "button",
+                T.c("accent") if hover else T.c("text"),
+                T.c("bg"),
+                box_fill=T.c("card_hover") if hover else T.c("card"),
+                outline=T.c("accent") if hover else T.c("border_strong"),
+                radius=T.RADIUS["sm"],
+                pad_x=T.SPACE["md"],
+                pad_y=T.SPACE["sm"],
+                align="center",
+            )
+            photo = W.photo_of(img)
+            self._photos.append(photo)
             try:
-                img = decode_b64_image(b64)
-                img.thumbnail((320, 460), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self._photos.append(photo)
-                img_lbl = tk.Label(card, image=photo, bg=CARD_BG, cursor="hand2")
-                img_lbl.image = photo
-                img_lbl.pack(padx=14, pady=(0, 14))
-                img_lbl.bind(
-                    "<Button-1>",
-                    lambda e, b=b64, t=title: self._open_image(b, t),
-                )
+                btn.configure(image=photo)
+                btn.image = photo
             except Exception:
                 pass
 
-        self._scroll_bottom()
+        paint(False)
+        btn.bind("<Button-1>", lambda _e: self._on_regenerate())
+        W.bind_hover(btn, on_enter=lambda: paint(True), on_leave=lambda: paint(False))
+        W.make_focusable(btn, T.c("bg"), self._on_regenerate)
 
-    def _scroll_bottom(self):
-        self.root.after_idle(lambda: self.canvas.yview_moveto(1.0))
+    def _render_section(self, text: str):
+        wrap = tk.Frame(self.frame, bg=T.c("bg"))
+        wrap.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["sm"]))
+        tk.Label(
+            wrap,
+            text=text,
+            bg=T.c("bg"),
+            fg=T.c("text_muted"),
+            font=T.font("h2"),
+        ).pack(side="left")
+        tk.Frame(wrap, bg=T.c("border"), height=1).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(T.SPACE["sm"], 0),
+            pady=(T.SPACE["sm"], 0),
+        )
+
+    def _render_answer(self, msg: dict):
+        container = tk.Frame(self.frame, bg=T.c("bg"))
+        container.pack(
+            fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["xs"], T.SPACE["sm"])
+        )
+        msg["_widget"] = container
+
+        # 正文用只读 Text 而不是 Label —— Label 不能选中,复制不出来。
+        # Text 没有 wraplength,只能靠左右内缩把行宽压回 _content_w,
+        # 否则窗口一宽,长行就会横贯整个画布(和引用卡片对不齐)。
+        avail = max(1, self.canvas.winfo_width() - 2 * T.SPACE["xl"])
+        inset = max(0, (avail - self._content_w) // 2)
+        txt = W.selectable_text(container, T.font("body"), T.c("bg"), T.c("text"))
+        txt.pack(fill="x", padx=(inset, inset))
+        W.attach_text_menu(txt, self.root)
+        txt.tag_configure(
+            "code",
+            font=T.font_mono(9),
+            background=T.c("code_bg"),
+            lmargin1=T.SPACE["md"],
+            lmargin2=T.SPACE["md"],
+            rmargin=T.SPACE["md"],
+            spacing1=T.SPACE["sm"],
+            spacing3=T.SPACE["sm"],
+        )
+        self._answer_text = txt
+
+        text = msg.get("text", "")
+        if msg.get("streaming"):
+            self._set_answer_into(txt, (text + " ▌") if text else "…", settle=True)
+            self._answer_msg = msg
+            return
+
+        self._fill_answer(txt, text)
+        self._render_copy_button(container, text)
+
+    def _set_answer_into(self, txt: tk.Text, s: str, settle: bool = False):
+        """整体重写正文。内容短、节流到 60ms 一次,所以不做增量插入。"""
+        txt.delete("1.0", "end")
+        txt.insert("1.0", s)
+        W.fit_height(txt, settle=settle)
+
+    def _fill_answer(self, txt: tk.Text, text: str):
+        """定稿排版:代码段套 code 标签(等宽 + 淡底 + 内缩)。"""
+        for seg_kind, seg_text in _split_code_blocks(text):
+            if seg_kind == "code":
+                txt.insert("end", seg_text + "\n", "code")
+            elif seg_text:
+                txt.insert("end", seg_text)
+        W.fit_height(txt, settle=True)
+
+    def _render_copy_button(self, parent, text: str):
+        bar = tk.Frame(parent, bg=T.c("bg"))
+        bar.pack(fill="x", pady=(T.SPACE["sm"], 0))
+        btn = tk.Label(
+            bar,
+            text="复制答案",
+            bg=T.c("bg"),
+            fg=T.c("text_faint"),
+            font=T.font("micro"),
+            cursor="hand2",
+            padx=T.SPACE["xs"],
+        )
+        btn.pack(side="left")
+
+        def copy(_e=None):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            btn.configure(text="已复制", fg=T.c("success"))
+            self.root.after(
+                1400, lambda: btn.configure(text="复制答案", fg=T.c("text_faint"))
+            )
+
+        btn.bind("<Button-1>", copy)
+        W.bind_hover(
+            btn,
+            on_enter=lambda: btn.configure(fg=T.c("accent")),
+            on_leave=lambda: btn.configure(fg=T.c("text_faint")),
+        )
+        W.make_focusable(btn, T.c("bg"), copy)
+
+    def _render_citations(self, msg: dict):
+        self._render_section("引用来源")
+        for i, (b64, hit) in enumerate(msg["tiles"], 1):
+            self._render_citation_card(b64, hit, i)
+
+    def _render_citation_card(self, b64: str, hit: dict, idx: int):
+        """白底描边卡片:缩略图 + 标题 + 页码/相似度。点缩略图看大图,点其余开 PDF。"""
+        pad = T.SPACE["md"]
+        w = max(240, self._content_w)
+        thumb_box = (int(74 * T.UI_SCALE), int(96 * T.UI_SCALE))
+
+        card = tk.Canvas(
+            self.frame,
+            width=w,
+            height=int(104 * T.UI_SCALE),  # 占位高度,量完信息块后修正
+            bg=T.c("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        card.pack(fill="x", padx=T.SPACE["xl"], pady=(0, T.SPACE["sm"]))
+
+        title = self._titles.get(hit.get("article_id")) or title_of(hit.get("url", ""))
+        x = pad
+        thumb_lbl = None
+        thumb_h = 0
+        if b64:
+            try:
+                img = decode_b64_image(b64)
+                img.thumbnail(thumb_box, Image.LANCZOS)
+                thumb = W.photo_of(img)
+                self._photos.append(thumb)
+                thumb_lbl = tk.Label(
+                    card, image=thumb, bg=T.c("card"), bd=0, cursor="hand2"
+                )
+                thumb_lbl.image = thumb
+                x += thumb.width() + pad
+                thumb_h = thumb.height()
+            except Exception:
+                thumb_lbl = None
+
+        tw = max(120, w - x - pad)
+
+        # 信息块:交给 Frame + pack 自己排垂直布局,避免手算 y 导致换行标题被盖住
+        info = tk.Frame(card, bg=T.c("card"))
+        title_lbl = tk.Label(
+            info,
+            text=f"[{idx}]  {title}",
+            bg=T.c("card"),
+            fg=T.c("accent"),
+            font=T.font("label"),
+            justify="left",
+            anchor="w",
+            wraplength=tw,
+            cursor="hand2",
+        )
+        title_lbl.pack(anchor="w", fill="x")
+
+        page = int(hit.get("tile_index", 0)) + 1
+        meta = f"第 {page} 页"
+        if int(hit.get("chunk_index", 0) or 0) > 0:
+            meta += f" · 第 {int(hit['chunk_index']) + 1} 段"
+        meta += f" · 相似度 {float(hit.get('score', 0.0)):.3f}"
+        meta_lbl = tk.Label(
+            info,
+            text=meta,
+            bg=T.c("card"),
+            fg=T.c("text_muted"),
+            font=T.font("caption"),
+            justify="left",
+            anchor="w",
+        )
+        meta_lbl.pack(anchor="w", fill="x", pady=(T.SPACE["xs"], 0))
+
+        hint_lbl = tk.Label(
+            info,
+            text="点击打开 PDF",
+            bg=T.c("card"),
+            fg=T.c("text_faint"),
+            font=T.font("micro"),
+            justify="left",
+            anchor="w",
+            cursor="hand2",
+        )
+        hint_lbl.pack(anchor="w", fill="x", pady=(T.SPACE["sm"], 0))
+
+        info.update_idletasks()
+        h = max(int(80 * T.UI_SCALE), thumb_h, info.winfo_reqheight()) + 2 * pad
+        card.configure(height=h)
+
+        # 三种外观:常态 / 悬停 / 键盘聚焦(聚焦用主色描边,与 hover 区分开)
+        normal = W.rounded_photo(
+            w, h, T.RADIUS["md"], T.c("card"), T.c("bg"), outline=T.c("border")
+        )
+        hover = W.rounded_photo(
+            w,
+            h,
+            T.RADIUS["md"],
+            T.c("card_hover"),
+            T.c("bg"),
+            outline=T.c("border_strong"),
+        )
+        focused = W.rounded_photo(
+            w,
+            h,
+            T.RADIUS["md"],
+            T.c("card_hover"),
+            T.c("bg"),
+            outline=T.c("focus"),
+            outline_w=2,
+        )
+        self._photos.extend([normal, hover, focused])
+        bg_id = card.create_image(0, 0, anchor="nw", image=normal)
+        card.tag_lower(bg_id)  # 背景图是后建的,必须沉底,否则会盖住信息块
+
+        card.create_window(x, pad, anchor="nw", window=info, width=tw)
+        if thumb_lbl is not None:
+            card.create_window(
+                pad, max(pad, (h - thumb_h) // 2), anchor="nw", window=thumb_lbl
+            )
+
+        def repaint(color: str):
+            def walk(widget):
+                for child in widget.winfo_children():
+                    try:
+                        child.configure(bg=color)
+                    except Exception:
+                        pass
+                    walk(child)
+
+            walk(card)
+
+        def open_pdf(_e=None):
+            self._open_hit(hit, title)
+
+        # 悬停与聚焦会同时发生,用一份状态决定最终外观(聚焦优先)
+        state = {"hover": False, "focus": False}
+
+        def paint(_e=None):
+            if state["focus"]:
+                card.itemconfigure(bg_id, image=focused)
+                repaint(T.c("card_hover"))
+            elif state["hover"]:
+                card.itemconfigure(bg_id, image=hover)
+                repaint(T.c("card_hover"))
+            else:
+                card.itemconfigure(bg_id, image=normal)
+                repaint(T.c("card"))
+
+        def set_state(key, value):
+            def apply(_e=None):
+                state[key] = value
+                paint()
+
+            return apply
+
+        W.bind_hover(card, set_state("hover", True), set_state("hover", False))
+        card.bind("<FocusIn>", set_state("focus", True), add="+")
+        card.bind("<FocusOut>", set_state("focus", False), add="+")
+
+        # 键盘可达:Tab 聚焦,Enter / Space 打开 PDF
+        card.configure(takefocus=1)
+        for key in ("<Return>", "<KP_Enter>", "<space>"):
+            card.bind(key, open_pdf, add="+")
+
+        for widget in (card, info, title_lbl, meta_lbl, hint_lbl):
+            widget.bind("<Button-1>", open_pdf, add="+")
+        if thumb_lbl is not None:
+            thumb_lbl.bind(
+                "<Button-1>", lambda _e: self._open_image(b64, title), add="+"
+            )
+
+    # ---- 加载态 ----
+
+    def _start_loading(self, text: str = "正在检索相关页面"):
+        if self._loading_active:
+            return
+        self._loading_active = True
+        self._loading_base = text
+        self._loading_frame = tk.Frame(self.frame, bg=T.c("bg"))
+        self._loading_frame.pack(
+            fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["sm"])
+        )
+        self._loading_label = tk.Label(
+            self._loading_frame,
+            text=text,
+            bg=T.c("bg"),
+            fg=T.c("text_muted"),
+            font=T.font("body"),
+            anchor="w",
+            justify="left",
+        )
+        self._loading_label.pack(fill="x")
+
+        skel = tk.Frame(self._loading_frame, bg=T.c("bg"))
+        skel.pack(fill="x", pady=(T.SPACE["sm"], 0))
+        for frac in (0.92, 0.68):
+            bar = W.rounded_photo(
+                max(40, int(self._content_w * frac)),
+                int(12 * T.UI_SCALE),
+                T.RADIUS["sm"],
+                T.c("skeleton"),
+                T.c("bg"),
+            )
+            self._photos.append(bar)
+            lbl = tk.Label(skel, image=bar, bg=T.c("bg"), bd=0)
+            lbl.image = bar
+            lbl.pack(anchor="w", pady=(0, T.SPACE["xs"]))
+
+        self._dot = 0
+        self._tick_loading()
+        self._scroll_bottom(True)
+
+    def _tick_loading(self):
+        if not self._loading_active:
+            return
+        self._dot = (self._dot + 1) % 4
+        stick = self._at_bottom()
+        try:
+            self._loading_label.configure(text=self._loading_base + "·" * self._dot)
+        except Exception:
+            return
+        self._loading_job = self.root.after(420, self._tick_loading)
+        self._scroll_bottom(stick)
+
+    def _set_loading_text(self, text: str):
+        self._loading_base = text
+        if self._loading_active:
+            try:
+                self._loading_label.configure(text=text)
+            except Exception:
+                pass
+
+    def _cancel_loading_job(self):
+        if self._loading_job:
+            try:
+                self.root.after_cancel(self._loading_job)
+            except Exception:
+                pass
+            self._loading_job = None
+
+    def _stop_loading(self):
+        self._cancel_loading_job()
+        self._loading_active = False
+        frame = getattr(self, "_loading_frame", None)
+        if frame is not None:
+            try:
+                frame.destroy()
+            except Exception:
+                pass
+            self._loading_frame = None
+
+    # ---------- 滚动 ----------
+
+    def _at_bottom(self) -> bool:
+        """当前视图是否停在底部。必须在改动内容【之前】调用才有意义。"""
+        try:
+            return self.canvas.yview()[1] >= 0.995
+        except Exception:
+            return True
+
+    def _view_state(self) -> tuple[bool, float]:
+        """(是否停在底部, 顶部比例)。重建界面前取一次,重建后据此还原。"""
+        try:
+            top, bottom = self.canvas.yview()
+            return bottom >= 0.995, top
+        except Exception:
+            return True, 0.0
+
+    def _scroll_bottom(self, stick: bool = True):
+        """stick=True 时把视图吸到底部;False 表示用户正在上翻,不去抢。"""
+        if not stick:
+            return
+
+        def go():
+            try:
+                # 顺序很关键:先让几何算完并刷新滚动范围,再移动。
+                # 否则 moveto(1.0) 会按【旧】范围钳制,结果停在中途。
+                self.canvas.update_idletasks()
+                h = max(self.frame.winfo_reqheight(), self.canvas.winfo_height())
+                self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), h))
+                self.canvas.yview_moveto(1.0)
+            except Exception:
+                pass
+
+        self.root.after_idle(go)
 
     # ---------- 交互 ----------
 
     def _on_enter(self, event):
+        if event.state & 0x0001:  # Shift+Enter → 换行
+            return None
         self._on_send()
-        return "break"  # 阻止 Enter 插入换行
+        return "break"
+
+    def _clear_input(self):
+        self.input.delete("1.0", "end")
 
     def _on_send(self):
         if self._busy:
@@ -383,58 +1141,272 @@ class App:
         self._add_user(text)
 
         if not self._serve_ready:
-            self._add_note("检索服务尚未就绪,正在启动,请稍候几秒再试...")
+            self._add_note("检索服务尚未就绪,正在启动,请稍候几秒再试…")
             threading.Thread(target=self._ensure_serve, daemon=True).start()
             return
 
+        self._run_query(text)
+
+    def _run_query(self, text: str):
+        """检索 + 生成。重试时复用同一个问题,不再追加用户气泡。"""
+        self._last_question = text
+        self._stopped = False
+        self._stop_event.clear()
+        # 记进历史("重新生成"同问同答,会在存储层合并成一条)
+        self._hist_entry = self.history.remember(text)
+        self._hist_pos = None
+        self._hist_draft = ""
         self._busy = True
-        self._add_note("⏳ 正在检索截图并生成答案,请稍候...")
+        self._update_send_button()
+        self._show_stop(True)
+        self._start_loading("正在检索相关页面")
         threading.Thread(target=self._do_search, args=(text,), daemon=True).start()
+
+    def _on_stop(self):
+        """停止生成:置取消信号,后台循环下一轮就退出,已收到的文字保留。"""
+        if not self._busy:
+            return
+        self._stopped = True
+        self._stop_event.set()
+        if self._loading_active:
+            self._set_loading_text("正在停止…")
+        self._update_stop_button()
+
+    def _on_regenerate(self):
+        """重新生成:用上一次的问题重跑。答案为空或生成失败时给出这个入口。"""
+        if self._busy or not self._last_question:
+            return
+        self._run_query(self._last_question)
+
+    def _select_all_input(self, _e=None):
+        self.input.tag_add("sel", "1.0", "end-1c")
+        self.input.mark_set("insert", "1.0")
+        return "break"
+
+    # ---------- 查询历史 ----------
+
+    def _on_history(self):
+        if self._history_panel is not None:
+            self._history_panel.win.lift()
+            return
+        self._history_panel = H.HistoryPanel(
+            self.root,
+            self.history,
+            on_pick=self._reask,
+            on_close=self._forget_history_panel,
+        )
+
+    def _forget_history_panel(self):
+        self._history_panel = None
+
+    def _reask(self, question: str):
+        """从历史里点一条:填进输入框并直接提问。"""
+        self._replace_input(question)
+        self._on_send()
+
+    def _replace_input(self, text: str):
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", text)
+        self.input.mark_set("insert", "end-1c")
+        self.input.focus_set()
+
+    def _on_input_up(self, _e=None):
+        """↑:光标在首行时召回上一条历史问题。"""
+        on_first_line = self.input.index("insert").split(".")[0] == "1"
+        if self._hist_pos is not None or on_first_line:
+            return self._recall_history(+1)
+        return None  # 交给 tk:光标上移一行
+
+    def _on_input_down(self, _e=None):
+        """↓:只有在召回态才接管(往回翻到更新的一条)。"""
+        if self._hist_pos is None:
+            return None
+        return self._recall_history(-1)
+
+    def _recall_history(self, delta: int):
+        """``delta=+1`` 往更早翻,``-1`` 往更新翻;翻过头就恢复召回前的草稿。"""
+        items = self.history.questions()
+        if not items:
+            return None
+        if self._hist_pos is None:
+            self._hist_draft = self.input.get("1.0", "end-1c")
+            self._hist_pos = 0
+        else:
+            self._hist_pos += delta
+        if self._hist_pos < 0:  # 回到最新之后 = 回到草稿
+            self._hist_pos = None
+            self._replace_input(self._hist_draft)
+            return "break"
+        self._hist_pos = min(self._hist_pos, len(items) - 1)
+        self._replace_input(items[self._hist_pos])
+        return "break"
+
+    def _send_hover_on(self):
+        self._send_hover = True
+        self._update_send_button()
+
+    def _send_hover_off(self):
+        self._send_hover = False
+        self._update_send_button()
+
+    def _stop_hover_on(self):
+        self._stop_hover = True
+        self._update_stop_button()
+
+    def _stop_hover_off(self):
+        self._stop_hover = False
+        self._update_stop_button()
+
+    def _show_stop(self, show: bool):
+        """打包顺序:send 先占最右,stop 紧跟其后排到它左边,box 再吃掉剩余宽度。"""
+        if show == self._stop_shown:
+            return
+        self._stop_shown = show
+        if show:
+            self._update_stop_button()
+            self.stop_btn.pack(
+                side="right",
+                after=self.send_btn,
+                padx=(0, T.SPACE["sm"]),
+                anchor="s",
+            )
+        else:
+            self.stop_btn.pack_forget()
+
+    def _update_stop_button(self):
+        if not self._stop_shown:
+            return
+        fill = T.c("border_strong") if self._stop_hover else T.c("card")
+        img = W.render_label_box(
+            "停止生成",
+            "button",
+            T.c("text"),
+            T.c("bg"),
+            box_fill=fill,
+            outline=T.c("border_strong"),
+            radius=T.RADIUS["sm"],
+            pad_x=T.SPACE["lg"],
+            pad_y=T.SPACE["sm"],
+            align="center",
+        )
+        photo = W.photo_of(img)
+        self._stop_photo = photo
+        try:
+            self.stop_btn.configure(image=photo, cursor="hand2")
+            self.stop_btn.image = photo
+        except Exception:
+            pass
+
+    def _update_send_button(self):
+        if self._busy:
+            fill, fg, label, cursor = (
+                T.c("border"),
+                T.c("text_faint"),
+                "生成中",
+                "arrow",
+            )
+        elif self._send_hover:
+            fill, fg, label, cursor = (
+                T.c("accent_hover"),
+                T.c("on_accent"),
+                "发送",
+                "hand2",
+            )
+        else:
+            fill, fg, label, cursor = T.c("accent"), T.c("on_accent"), "发送", "hand2"
+        img = W.render_label_box(
+            label,
+            "button",
+            fg,
+            T.c("bg"),
+            box_fill=fill,
+            radius=T.RADIUS["sm"],
+            pad_x=T.SPACE["lg"],
+            pad_y=T.SPACE["sm"],
+            align="center",
+        )
+        photo = W.photo_of(img)
+        self._send_photo = photo
+        try:
+            self.send_btn.configure(image=photo, cursor=cursor)
+            self.send_btn.image = photo
+        except Exception:
+            pass
+
+    # ---------- 检索 → 生成 ----------
 
     def _do_search(self, text: str):
         try:
             resp = search(text)
             hits = resp["results"][0]["hits"]
         except Exception as e:
+            self.root.after(0, self._stop_loading)
             self.root.after(0, lambda err=e: self._show_error(err))
             self.root.after(0, self._clear_busy)
             return
         if not hits:
-            self.root.after(0, lambda: self._add_note("没有找到相关结果,换个说法试试。"))
+            self.root.after(0, self._stop_loading)
+            self.root.after(
+                0, lambda: self._add_note("没有找到相关结果,换个说法试试。")
+            )
             self.root.after(0, self._clear_busy)
             return
         self._generate(text, hits)  # 仍在后台线程,继续生成答案
 
     def _show_results(self, hits: list):
-        if not hits:
-            self._add_note("没有找到相关结果,换个说法试试。")
-            return
-        for i, h in enumerate(hits, 1):
-            self._add_result_card(h, i)
+        """VLM 不可用时的降级:只展示检索到的引用卡片。"""
+        seen, tiles = set(), []
+        for h in sorted(hits, key=lambda x: float(x.get("score", 0.0)), reverse=True):
+            key = (h.get("article_id"), h.get("tile_index"), h.get("chunk_index"))
+            if key in seen:
+                continue
+            seen.add(key)
+            b64 = h.get("image_base64")
+            if b64:
+                tiles.append((b64, h))
+        if tiles:
+            self._append({"kind": "citations", "tiles": tiles})
+        else:
+            self._add_note("没有可显示的截图。")
 
     def _generate(self, text: str, hits: list):
         """准备截图 → 调 VLM 流式生成 → 前端流式显示答案 + 引用卡片。运行于后台线程。"""
+        if self._stop_event.is_set():
+            # 检索期间用户就点了停止,别再开生成
+            self.root.after(0, self._stop_loading)
+            self.root.after(0, lambda: self._add_note("已停止。"))
+            self.root.after(0, self._clear_busy)
+            return
+
         images = prepare_images(hits)
         if not images:
-            self.root.after(0, lambda: self._add_error(
-                "检索到了结果,但截图加载失败。以下为检索到的相关页面:"
-            ))
+            self.root.after(0, self._stop_loading)
+            self.root.after(
+                0,
+                lambda: self._add_error(
+                    "检索到了结果,但截图加载失败。以下为检索到的相关页面:"
+                ),
+            )
             self.root.after(0, lambda: self._show_results(hits))
             self.root.after(0, self._clear_busy)
             return
 
         cfg = _load_vlm_config()
         if not cfg["api_key"]:
-            self.root.after(0, lambda: self._add_error(
-                "未找到 VLM API key。请设置环境变量 PIXELRAG_VLM_API_KEY,\n"
-                "或确保 ~/.claude/settings.json 里有 ANTHROPIC_AUTH_TOKEN。\n"
-                "以下为检索到的相关页面:"
-            ))
+            self.root.after(0, self._stop_loading)
+            self.root.after(
+                0,
+                lambda: self._add_error(
+                    "未找到 VLM API key。请设置环境变量 PIXELRAG_VLM_API_KEY,\n"
+                    "或确保 ~/.claude/settings.json 里有 ANTHROPIC_AUTH_TOKEN。\n"
+                    "以下为检索到的相关页面:"
+                ),
+            )
             self.root.after(0, lambda: self._show_results(hits))
             self.root.after(0, self._clear_busy)
             return
 
-        # 在 UI 线程创建助手气泡,拿到可更新的 Label
+        self.root.after(0, lambda: self._set_loading_text("正在生成答案"))
         self._answer_ready = threading.Event()
         self.root.after(0, self._begin_answer)
         if not self._answer_ready.wait(timeout=5):
@@ -442,54 +1414,186 @@ class App:
             return
 
         full = ""
+        stopped = False
+        failed = False
         try:
-            for chunk in vlm_stream(images, text, cfg):
+            self._gen = vlm_stream(images, text, cfg)
+            for chunk in self._gen:
+                if self._stop_event.is_set():
+                    stopped = True
+                    break
                 full += chunk
                 self.root.after(0, lambda t=full: self._set_answer(t))
         except Exception as e:
-            self.root.after(0, lambda err=e: self._add_error(f"生成失败:{err}"))
-            if full:
-                self.root.after(0, lambda: self._set_answer(full + "\n\n[生成中断]"))
+            if self._stop_event.is_set():
+                stopped = True  # 主动中止引发的异常不算失败,别再弹一次错
+            else:
+                failed = True  # 已经报过错了,_finish_answer 别再补一条"没返回内容"
+                err = str(e)
+                self.root.after(
+                    0, lambda m=err: self._add_error(f"生成失败:{m}", retry=True)
+                )
+                if full:
+                    self.root.after(0, lambda t=full: self._set_answer(t))
         finally:
-            self.root.after(0, lambda: self._finish_answer(images))
+            # 显式 close 掉生成器,底层的 HTTP 流立刻断开,不用等 GC
+            gen, self._gen = self._gen, None
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+            self.root.after(0, lambda: self._finish_answer(images, stopped, failed))
 
     def _begin_answer(self):
-        row = tk.Frame(self.frame, bg=BG)
-        row.pack(fill="x", padx=16, pady=(14, 2))
-        lbl = tk.Label(
-            row, text="", bg=CARD_BG, fg=TEXT_FG, justify="left", anchor="w",
-            wraplength=680, font=(FONT, 12), padx=14, pady=10,
-        )
-        lbl.pack(side="left", fill="x", expand=True)
-        self._answer_label = lbl
+        self._stop_loading()
+        msg = {"kind": "answer", "text": "", "streaming": True}
+        self.messages.append(msg)
+        self._render_message(msg)
+        self._answer_msg = msg
+        self._scroll_bottom(True)
         self._answer_ready.set()
-        self._scroll_bottom()
 
     def _set_answer(self, text: str):
-        lbl = getattr(self, "_answer_label", None)
-        if lbl is not None:
-            lbl.configure(text=text)
-            self._scroll_bottom()
+        msg = self._answer_msg
+        if msg is None:
+            return
+        msg["text"] = text
+        if self._paint_job is None:
+            self._paint_job = self.root.after(
+                T.MOTION["stream_throttle"], self._paint_answer
+            )
 
-    def _finish_answer(self, images):
-        lbl = getattr(self, "_answer_label", None)
-        if lbl is not None and not lbl.cget("text"):
-            lbl.configure(text="(VLM 未返回内容,请重试。)")
+    def _paint_answer(self):
+        self._paint_job = None
+        msg, txt = self._answer_msg, self._answer_text
+        if msg is None or txt is None:
+            return
+        text = msg.get("text", "")
+        stick = self._at_bottom()
+        try:
+            self._set_answer_into(txt, (text + " ▌") if text else "…")
+        except tk.TclError:
+            return  # 主题切换把控件重建了,这一帧直接丢掉
+        self._scroll_bottom(stick)
+
+    def _finish_answer(self, images, stopped: bool = False, failed: bool = False):
+        if self._paint_job:
+            try:
+                self.root.after_cancel(self._paint_job)
+            except Exception:
+                pass
+            self._paint_job = None
+
+        msg = self._answer_msg
+        self._answer_msg = None
+        self._answer_text = None
+
+        if msg is not None:
+            msg["streaming"] = False
+            text = msg.get("text", "")
+            if stopped:
+                # 保留已经吐出来的部分,补一句话说明是用户主动停的
+                msg["text"] = (
+                    (text.rstrip() + "\n\n（已停止生成）")
+                    if text.strip()
+                    else "（已停止生成）"
+                )
+                self._redraw_answer(msg)
+            elif not text.strip():
+                # 一个字都没有:留个空气泡没意义,换成可重试的错误。
+                # failed 时上面已经报过具体原因了,这里不再补一条重复的。
+                self._drop_message(msg)
+                if not failed:
+                    self._add_error("模型没有返回任何内容。", retry=True)
+            else:
+                self._redraw_answer(msg)
+
+        # 回填历史:命中页数 + 答案(方便以后直接复制,不用重跑一遍)
+        self.history.update(
+            self._hist_entry,
+            hits=len(images),
+            answer=(msg or {}).get("text", ""),
+        )
+
         if images:
-            self._add_note("引用来源:")
-            for i, (_b64, hit) in enumerate(images, 1):
-                self._add_result_card(hit, i)
+            self._append({"kind": "citations", "tiles": list(images)})
+        self._scroll_bottom(True)
         self._clear_busy()
+
+    def _redraw_answer(self, msg: dict):
+        """定稿重绘:分段代码块 + 复制按钮。"""
+        widget = msg.get("_widget")
+        if widget is not None:
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        self._render_message(msg)
+
+    def _drop_message(self, msg: dict):
+        """把一条消息从数据模型和界面上一起撤掉。"""
+        try:
+            self.messages.remove(msg)
+        except ValueError:
+            pass
+        widget = msg.get("_widget")
+        if widget is not None:
+            try:
+                widget.destroy()
+            except Exception:
+                pass
 
     def _show_error(self, e: Exception):
         self._add_error(
-            f"查询失败:{e}\n请确认检索服务已启动、索引文件完整。"
+            f"查询失败:{e}\n请确认检索服务已启动、索引文件完整。", retry=True
         )
 
     def _clear_busy(self):
         self._busy = False
+        self._stop_hover = False
+        self._show_stop(False)
+        self._update_send_button()
+
+    # ---------- 主题 ----------
+
+    def _toggle_theme(self):
+        T.set_mode(T.other_mode())
+        W._clear_cache()
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """换主题 = 用令牌重放全部界面(tkinter 不支持热改样式)。"""
+        draft = self.input.get("1.0", "end-1c")
+        state = self._view_state()  # 必须在销毁旧界面之前取
+        # 历史面板是独立窗口,颜色也是构建时取的 —— 关掉,重建完再打开
+        reopen_history = self._history_panel is not None
+        if self._history_panel is not None:
+            self._history_panel.close()
+            self._history_panel = None
+
+        for w in self.root.winfo_children():
+            w.destroy()
+        self._photos.clear()
+        self._answer_text = None
+
+        self.root.configure(bg=T.c("bg"))
+        self._build_ui()
+        self.input.insert("1.0", draft)
+        self._render_all(view_state=state)
+        self._set_status()
+        self._update_send_button()
+        if reopen_history:
+            self._on_history()
 
     # ---------- 打开图片 / PDF ----------
+
+    def _open_hit(self, hit: dict, title: str):
+        url = hit.get("url", "")
+        if url and os.path.exists(url):
+            os.startfile(url)
+        else:
+            self._add_note(f"找不到 PDF 文件:{title}")
 
     def _open_image(self, b64: str, title: str):
         try:
@@ -498,21 +1602,19 @@ class App:
             return
         win = tk.Toplevel(self.root)
         win.title(title or "页面截图")
-        win.configure(bg="#000000")
+        win.configure(bg=T.c("bg"))
         max_w = int(win.winfo_screenwidth() * 0.85)
         max_h = int(win.winfo_screenheight() * 0.85)
         img.thumbnail((max_w, max_h), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
+        photo = W.photo_of(img)
         self._photos.append(photo)
-        lbl = tk.Label(win, image=photo, bg="#000000")
+        lbl = tk.Label(win, image=photo, bg=T.c("bg"), bd=0)
         lbl.image = photo
         lbl.pack()
-
-    def _open_pdf(self, url: str):
-        if url and os.path.exists(url):
-            os.startfile(url)
-        else:
-            self._add_note("找不到该论文 PDF 文件。")
+        # 焦点必须落在预览窗内,Escape 才会送到这里(否则被主窗吃掉)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.transient(self.root)
+        win.focus_set()
 
     # ---------- 服务 ----------
 
@@ -534,6 +1636,13 @@ class App:
 
 
 def main():
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 高分屏下不再被位图拉伸
+    except Exception:
+        pass
+    T.set_ui_scale(screen_scale())
     root = tk.Tk()
     App(root)
     root.mainloop()
