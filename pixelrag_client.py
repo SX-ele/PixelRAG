@@ -334,7 +334,9 @@ class App:
         self._serve_ready = check_health()
         self._titles = _load_titles()
         self._content_w = T.CONTENT_MAX_WIDTH
-        self._inset = T.SPACE["xl"]  # 消息列到画布边的留白(宽屏时变大,见 _content_metrics)
+        self._inset = T.SPACE[
+            "xl"
+        ]  # 消息列到画布边的留白(宽屏时变大,见 _content_metrics)
         self._canvas_w = 0
 
         self._apply_window_geometry()
@@ -402,7 +404,7 @@ class App:
         W.bind_hover(
             self.theme_btn,
             on_enter=lambda: self.theme_btn.configure(
-                fg=T.c("accent"), bg=T.c("accent_soft")
+                fg=T.c("accent_text"), bg=T.c("accent_soft")
             ),
             on_leave=lambda: self.theme_btn.configure(
                 fg=T.c("text_muted"), bg=T.c("surface")
@@ -427,7 +429,7 @@ class App:
         W.bind_hover(
             self.history_btn,
             on_enter=lambda: self.history_btn.configure(
-                fg=T.c("accent"), bg=T.c("accent_soft")
+                fg=T.c("accent_text"), bg=T.c("accent_soft")
             ),
             on_leave=lambda: self.history_btn.configure(
                 fg=T.c("text_muted"), bg=T.c("surface")
@@ -455,32 +457,72 @@ class App:
         self.bottom.pack(side="bottom", fill="x")
         tk.Frame(self.bottom, bg=T.c("border"), height=1).pack(side="top", fill="x")
 
-        row = tk.Frame(self.bottom, bg=T.c("bg"))
-        row.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["md"], T.SPACE["sm"]))
+        # 输入框正对着正文那条窄栏:同宽、同留白,不是通栏(DeepSeek 就是这样)。
+        # 留白在 _on_canvas_configure 里跟着聊天画布的宽度同步 —— 侧栏一开一合,
+        # 输入框和消息列会一起挪,不会各走各的。
+        self.bottom_row = tk.Frame(self.bottom, bg=T.c("bg"))
+        self.bottom_row.pack(
+            fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["md"], T.SPACE["sm"])
+        )
 
-        # 发送按钮(圆角图片按钮,支持 hover / disabled 两态)
-        self.send_btn = tk.Label(row, bg=T.c("bg"), bd=0, cursor="hand2")
-        self.send_btn.pack(side="right", padx=(T.SPACE["md"], 0), anchor="s")
+        # 输入框:圆角方框 + 1px 描边,聚焦时描边变主色(DeepSeek 样式)。
+        # tk 没有 CSS 圆角,所以复用引用卡片那套画法 —— Canvas 铺一张圆角底图并
+        # tag_lower 沉底,再用 create_window 放进 Text 和两个按钮。Text 自己的底色
+        # 和填充同色,于是方角被藏进圆角里,只有描边露出来。
+        self.input_box = tk.Canvas(
+            self.bottom_row, bg=T.c("bg"), highlightthickness=0, bd=0, height=1
+        )
+        self.input_box.pack(fill="x", expand=True)
+        self._input_bg_id = None
+        self._input_win_id = None
+        self._input_photo = None
+        self._input_focused = False
+        self._input_pad = (T.SPACE["lg"], T.SPACE["md"])  # 文字到描边的距离
+
+        # 发送 / 停止按钮是画布里的窗口项,浮在方框右下角(DeepSeek 的按钮在框内)。
+        # 底色取 input_bg 而不是 bg:它们压在圆角填充上,方角才不会露出来。
+        # bd/padx/pady 全清零:Label 的默认边框和内边距会给按钮图套一圈看不见的
+        # 外框,让底图看起来离描边比设定的间距更远。
+        self.send_btn = tk.Label(
+            self.input_box,
+            bg=T.c("input_bg"),
+            bd=0,
+            padx=0,
+            pady=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
         self.send_btn.bind("<Button-1>", lambda _e: self._on_send())
         W.bind_hover(
             self.send_btn, on_enter=self._send_hover_on, on_leave=self._send_hover_off
         )
-        W.make_focusable(self.send_btn, T.c("bg"), self._on_send)
+        W.make_focusable(self.send_btn, T.c("input_bg"), self._on_send)
 
-        # 停止按钮:只在生成期间出现,平时不 pack(不占位)
-        self.stop_btn = tk.Label(row, bg=T.c("bg"), bd=0, cursor="hand2")
+        # 停止按钮:只在生成期间显示(位置一直预留着,文字区不会跟着跳)
+        self.stop_btn = tk.Label(
+            self.input_box,
+            bg=T.c("input_bg"),
+            bd=0,
+            padx=0,
+            pady=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
         self.stop_btn.bind("<Button-1>", lambda _e: self._on_stop())
         W.bind_hover(
             self.stop_btn, on_enter=self._stop_hover_on, on_leave=self._stop_hover_off
         )
-        W.make_focusable(self.stop_btn, T.c("bg"), self._on_stop)
+        W.make_focusable(self.stop_btn, T.c("input_bg"), self._on_stop)
         self._stop_shown = False
+        self._stop_item = None
+        self._send_item = None
+        self._btn_reserve = 0  # 文字右侧留给按钮的宽度(建完按钮才知道)
+        self._send_img_w = self._stop_img_w = 0
+        self._bottom_inset = (-1, -1)  # 底栏当前 (左, 右) 留白,用来跳过无变化的设置
 
-        # 输入区:底线式,聚焦时底线变强调色
-        box = tk.Frame(row, bg=T.c("bg"))
-        box.pack(side="left", fill="x", expand=True)
+        sp1, sp2, sp3 = W.line_spacing(T.font("input"))
         self.input = tk.Text(
-            box,
+            self.input_box,
             height=2,
             bg=T.c("input_bg"),
             fg=T.c("text"),
@@ -492,10 +534,10 @@ class App:
             wrap="word",
             padx=0,
             pady=0,
-            spacing1=2,
-            spacing3=2,
+            spacing1=sp1,
+            spacing2=sp2,
+            spacing3=sp3,
         )
-        self.input.pack(fill="x")
         self.input.bind("<Return>", self._on_enter)
         self.input.bind("<Escape>", lambda _e: self._clear_input())
         self.input.bind("<Control-a>", self._select_all_input)
@@ -503,14 +545,25 @@ class App:
         self.input.bind("<Up>", self._on_input_up)
         self.input.bind("<Down>", self._on_input_down)
         W.attach_text_menu(self.input, self.root, editable=True)
-        self.input.bind(
-            "<FocusIn>", lambda _e: self.input_line.configure(bg=T.c("accent"))
+        self.input.bind("<FocusIn>", lambda _e: self._layout_input_box(True))
+        self.input.bind("<FocusOut>", lambda _e: self._layout_input_box(False))
+
+        # 先把两张按钮图渲染出来:一是量出预留宽度,二是保证第一次要显示停止按钮时
+        # 手里已经有图(_update_stop_button 在未显示时是直接返回的)。
+        # 预留宽度按"停止按钮也在"的最宽情况算一次就定住 —— 之后停止按钮显隐、发送
+        # 按钮在「发送 / 生成中」之间切换,输入框里的文字都不会跟着伸缩。
+        self._render_send_image()
+        self._render_stop_image()
+        # 发送按钮的宽度被 min_w 钉住(「发送」和「生成中」一样宽),所以按当前这张量
+        # 就等于按最宽情况量。
+        self._btn_reserve = (
+            T.SPACE["sm"] + self._send_img_w + T.SPACE["sm"] + self._stop_img_w
         )
-        self.input.bind(
-            "<FocusOut>", lambda _e: self.input_line.configure(bg=T.c("input_line"))
-        )
-        self.input_line = tk.Frame(box, bg=T.c("input_line"), height=1)
-        self.input_line.pack(fill="x", pady=(T.SPACE["sm"], 0))
+        self._update_send_button()
+        self.stop_btn.configure(image=self._stop_photo)
+        self.stop_btn.image = self._stop_photo  # 先装上,量宽度也让它有尺寸
+        self.input_box.bind("<Configure>", lambda _e: self._layout_input_box())
+        self.root.after_idle(self._layout_input_box)
 
         hint = tk.Label(
             self.bottom,
@@ -520,6 +573,98 @@ class App:
             font=T.font("micro"),
         )
         hint.pack(side="top", pady=(0, T.SPACE["sm"]))
+
+    def _layout_input_box(self, focused: bool | None = None):
+        """重画输入框的圆角底,并把 ``Text`` 摆到内边距里面。
+
+        ``focused=None`` 表示"焦点态没变,只是尺寸变了"(``<Configure>`` 用)。底图走
+        ``W.rounded_photo``,两张(聚焦/未聚焦)按 key 缓存,来回切焦点不会重画。
+        """
+        box = self.input_box
+        if not box.winfo_exists():
+            return
+        if focused is not None:
+            self._input_focused = focused
+        pad_x, pad_y = self._input_pad
+        # -height 是"几行",tk 已经把它折算成含 spacing1/2/3 的完整行盒;拿不到就按
+        # 令牌兜底(理论上不会走到)。输入框不随内容长高,超长内容由 Text 自己滚动。
+        text_h = int(self.input.winfo_reqheight() or 0) or 2 * T.line_box_px("input")
+        w = max(1, box.winfo_width())
+        h = text_h + 2 * pad_y
+        if int(box.cget("height")) != h:
+            box.configure(height=h)
+        photo = W.rounded_photo(
+            w,
+            h,
+            T.RADIUS["lg"],
+            T.c("input_bg"),
+            T.c("bg"),
+            outline=T.c("focus") if self._input_focused else T.c("input_line"),
+        )
+        self._input_photo = photo  # 必须持有,否则会被 GC 成白块
+        if self._input_bg_id is None:
+            self._input_bg_id = box.create_image(0, 0, anchor="nw", image=photo)
+            box.tag_lower(self._input_bg_id)
+        else:
+            box.itemconfigure(self._input_bg_id, image=photo)
+            box.coords(self._input_bg_id, 0, 0)
+
+        # 文字区右端让开按钮区(预留宽度在 _build_bottom_bar 里按最宽情况定死)
+        edge = T.SPACE["sm"]
+        win_w = max(1, w - pad_x - self._btn_reserve)
+        if self._input_win_id is None:
+            self._input_win_id = box.create_window(
+                pad_x, pad_y, anchor="nw", window=self.input, width=win_w, height=text_h
+            )
+        else:
+            box.coords(self._input_win_id, pad_x, pad_y)
+            box.itemconfigure(self._input_win_id, width=win_w, height=text_h)
+
+        # 按钮贴在方框右下角:停止在左、发送在右,离描边各留一个小间距。
+        # 焦点环(highlight)也算在控件外框里,锚点要把它让出来,底图才真的离描边 edge。
+        ring = int(self.send_btn.cget("highlightthickness") or 0)
+        btn_y = h - edge + ring
+        send_w = self._send_img_w
+        if self._send_item is None:
+            self._send_item = box.create_window(
+                w - edge + ring, btn_y, anchor="se", window=self.send_btn
+            )
+        else:
+            box.coords(self._send_item, w - edge + ring, btn_y)
+        stop_x = w - edge + ring - send_w - T.SPACE["sm"]
+        if self._stop_item is None:
+            self._stop_item = box.create_window(
+                stop_x,
+                btn_y,
+                anchor="se",
+                window=self.stop_btn,
+                state="normal" if self._stop_shown else "hidden",
+            )
+        else:
+            box.coords(self._stop_item, stop_x, btn_y)
+        box.tag_raise(self._stop_item)
+        box.tag_raise(self._send_item)
+
+    def _layout_bottom_row(self, avail_w: int):
+        """让输入框与消息列左右对齐(同宽同留白)。
+
+        ``avail_w`` 是聊天画布的宽度 —— 输入框要对齐的是正文那条窄栏,不是整个窗口,
+        所以侧栏一开一合输入框也要跟着挪。
+        """
+        _, inset = self._content_metrics(avail_w)
+        # 底栏是通栏的(侧栏一开一合它不动),所以要让开聊天区左边那截侧栏、右边那截
+        # 滚动条,才能和消息列真正对齐 —— 只补 inset 会在侧栏打开时整体左移一整个侧栏。
+        left = right = inset
+        sb = getattr(self, "sidebar", None)
+        if sb is not None and sb.winfo_exists():
+            left += sb.winfo_width() + 1  # 侧栏 + 它右边那条 1px 分隔线
+        sc = getattr(self, "scroll", None)
+        if sc is not None and sc.winfo_exists():
+            right += sc.winfo_width()
+        if (left, right) == self._bottom_inset:
+            return
+        self._bottom_inset = (left, right)
+        self.bottom_row.pack_configure(padx=(left, right))
 
     def _build_body(self):
         body = tk.Frame(self.root, bg=T.c("bg"))
@@ -549,7 +694,7 @@ class App:
             troughcolor=T.c("bg"),
             activebackground=T.c("border_strong"),
             borderwidth=0,
-            width=10,
+            width=T.SCROLLBAR_W,
             relief="flat",
             elementborderwidth=0,
         )
@@ -579,12 +724,17 @@ class App:
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self._win, width=event.width)
+        self._layout_bottom_row(event.width)  # 输入框跟着消息列一起居中对齐
         new_w, new_inset = self._content_metrics(event.width)
         # 画布宽变了也要重排(即使 _content_w 已到上限):两侧留白是按画布宽算的,
         # 不重排的话窗口一宽正文就一直贴在左边,和居中的引用卡片对不齐。
         moved = abs(event.width - self._canvas_w) > 8
         self._canvas_w = event.width
-        if abs(new_w - self._content_w) > 8 or abs(new_inset - self._inset) > 8 or moved:
+        if (
+            abs(new_w - self._content_w) > 8
+            or abs(new_inset - self._inset) > 8
+            or moved
+        ):
             self._content_w, self._inset = new_w, new_inset
             self._schedule_reflow()
 
@@ -718,6 +868,7 @@ class App:
     def _render_user(self, msg: dict):
         row = tk.Frame(self.frame, bg=T.c("bg"))
         row.pack(fill="x", padx=self._inset, pady=(0, T.SPACE["msg"]))
+        pad_x, pad_y = T.BUBBLE_PAD
         img = W.render_label_box(
             msg["text"],
             "bubble",
@@ -725,8 +876,8 @@ class App:
             T.c("bg"),
             box_fill=T.c("user_bubble"),
             radius=T.RADIUS["md"],
-            pad_x=T.SPACE["md"],
-            pad_y=T.SPACE["sm"],
+            pad_x=pad_x,
+            pad_y=pad_y,
             max_w=int(self._content_w * 0.78),
         )
         photo = W.photo_of(img)
@@ -778,11 +929,11 @@ class App:
             img = W.render_label_box(
                 "重新生成",
                 "button",
-                T.c("accent") if hover else T.c("text"),
+                T.c("accent_text") if hover else T.c("text"),
                 T.c("bg"),
                 box_fill=T.c("card_hover") if hover else T.c("card"),
                 outline=T.c("accent") if hover else T.c("border_strong"),
-                radius=T.RADIUS["sm"],
+                radius=T.RADIUS_PILL,
                 pad_x=T.SPACE["md"],
                 pad_y=T.SPACE["sm"],
                 align="center",
@@ -831,15 +982,21 @@ class App:
         txt = W.selectable_text(container, T.font("answer"), T.c("bg"), T.c("text"))
         txt.pack(fill="x")
         W.attach_text_menu(txt, self.root)
+        # 代码块同样按 LINE_HEIGHT 铺行距,但要按**等宽字体自己的**行盒算:两种字体
+        # 的自然行高差得不少,照抄正文那个像素值会让代码行挤在一起。tk 的折行间距
+        # 会被对半分给折点两侧,所以 spacing1/3 取 gap 的上/下半(与 selectable_text 同理)。
+        code_font = T.font_mono(T.px_size("code"))
+        sp1, sp2, sp3 = W.line_spacing(code_font)
         txt.tag_configure(
             "code",
-            font=T.font_mono(14),
+            font=code_font,
             background=T.c("code_bg"),
             lmargin1=T.SPACE["md"],
             lmargin2=T.SPACE["md"],
             rmargin=T.SPACE["md"],
-            spacing1=T.SPACE["sm"],
-            spacing3=T.SPACE["sm"],
+            spacing1=sp1,
+            spacing2=sp2,
+            spacing3=sp3,
         )
         self._answer_text = txt
 
@@ -892,7 +1049,7 @@ class App:
         btn.bind("<Button-1>", copy)
         W.bind_hover(
             btn,
-            on_enter=lambda: btn.configure(fg=T.c("accent")),
+            on_enter=lambda: btn.configure(fg=T.c("accent_text")),
             on_leave=lambda: btn.configure(fg=T.c("text_faint")),
         )
         W.make_focusable(btn, T.c("bg"), copy)
@@ -952,7 +1109,8 @@ class App:
             info,
             text=f"[{idx}]  {title}",
             bg=T.c("card"),
-            fg=T.c("accent"),
+            fg=T.c("accent_text"),  # 白底上的强调色**文字**用 accent_text(4.33:1 的
+            # accent 是给填充/描边用的,小字不加粗时对比度不够)
             font=T.font("label"),
             justify="left",
             anchor="w",
@@ -1083,9 +1241,7 @@ class App:
         self._loading_active = True
         self._loading_base = text
         self._loading_frame = tk.Frame(self.frame, bg=T.c("bg"))
-        self._loading_frame.pack(
-            fill="x", padx=self._inset, pady=(0, T.SPACE["msg"])
-        )
+        self._loading_frame.pack(fill="x", padx=self._inset, pady=(0, T.SPACE["msg"]))
         self._loading_label = tk.Label(
             self._loading_frame,
             text=text,
@@ -1364,46 +1520,49 @@ class App:
         self._update_stop_button()
 
     def _show_stop(self, show: bool):
-        """打包顺序:send 先占最右,stop 紧跟其后排到它左边,box 再吃掉剩余宽度。"""
+        """停止按钮的显隐 = 画布窗口项的显示/隐藏(位置一直给它留着)。"""
         if show == self._stop_shown:
             return
         self._stop_shown = show
         if show:
             self._update_stop_button()
-            self.stop_btn.pack(
-                side="right",
-                after=self.send_btn,
-                padx=(0, T.SPACE["sm"]),
-                anchor="s",
+        if self._stop_item is not None:
+            self.input_box.itemconfigure(
+                self._stop_item, state="normal" if show else "hidden"
             )
-        else:
-            self.stop_btn.pack_forget()
 
-    def _update_stop_button(self):
-        if not self._stop_shown:
-            return
+    def _render_stop_image(self):
+        """画「停止生成」的按钮图(不管此刻显不显示 —— 建界面时要先量宽度)。"""
         fill = T.c("border_strong") if self._stop_hover else T.c("card")
         img = W.render_label_box(
             "停止生成",
             "button",
             T.c("text"),
-            T.c("bg"),
+            T.c("input_bg"),
             box_fill=fill,
             outline=T.c("border_strong"),
-            radius=T.RADIUS["sm"],
+            radius=T.RADIUS_PILL,
             pad_x=T.SPACE["lg"],
             pad_y=T.SPACE["sm"],
             align="center",
         )
         photo = W.photo_of(img)
         self._stop_photo = photo
+        self._stop_img_w = img.width
+        return photo
+
+    def _update_stop_button(self):
+        photo = self._render_stop_image()
+        if not self._stop_shown:
+            return
         try:
             self.stop_btn.configure(image=photo, cursor="hand2")
             self.stop_btn.image = photo
         except Exception:
             pass
 
-    def _update_send_button(self):
+    def _render_send_image(self):
+        """画「发送 / 生成中」的按钮图(按当前 busy / hover 态)。"""
         if self._busy:
             fill, fg, label, cursor = (
                 T.c("border"),
@@ -1424,15 +1583,21 @@ class App:
             label,
             "button",
             fg,
-            T.c("bg"),
+            T.c("input_bg"),
             box_fill=fill,
-            radius=T.RADIUS["sm"],
+            radius=T.RADIUS_PILL,
             pad_x=T.SPACE["lg"],
             pad_y=T.SPACE["sm"],
             align="center",
+            min_w=T.SEND_MIN_W,
         )
         photo = W.photo_of(img)
         self._send_photo = photo
+        self._send_img_w = img.width
+        return photo, cursor
+
+    def _update_send_button(self):
+        photo, cursor = self._render_send_image()
         try:
             self.send_btn.configure(image=photo, cursor=cursor)
             self.send_btn.image = photo

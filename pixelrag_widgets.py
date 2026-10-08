@@ -103,6 +103,23 @@ def tk_line_gap_px(font: tuple) -> int:
     return max(0, target - natural)
 
 
+def line_spacing(font: tuple) -> tuple[int, int, int]:
+    """给 ``tk.Text``(控件级或 tag 级)用的 ``(spacing1, spacing2, spacing3)``。
+
+    tk 会把 ``spacing2``(**段内折行**)对半分给折点两侧,于是同一个行高要求下,
+    段首行只吃到下半份、段末行只吃到上半份,而"硬换行后面的那行"两个份都吃 ——
+    按直觉写 spacing 会让整段行距忽紧忽松。只有
+    ``spacing1 = ceil(gap/2)``、``spacing2 = gap``、``spacing3 = floor(gap/2)``
+    这一组能让下面五种行盒**完全相等**(都等于 字号 × LINE_HEIGHT):
+
+    - 单行段落、多行段落的段首行 / 中间行 / 段末行、硬换行(``\\n``)之后那行。
+
+    实测记录与逐行断言见仓库外的 ``_uicheck/linecheck.py``。
+    """
+    gap = tk_line_gap_px(font)
+    return -(-gap // 2), gap, gap // 2
+
+
 # ---------------------------------------------------------------------------
 # 文本换行(CJK 友好)
 # ---------------------------------------------------------------------------
@@ -199,11 +216,15 @@ def render_label_box(
     align: str = "left",
     line_gap: int | None = None,
     bold: bool = False,
+    min_w: int | None = None,
 ) -> Image.Image:
     """把文本渲染成一张图片。``max_w=None`` 表示不折行(按钮用)。
 
     ``line_gap=None`` 时按主题行高(``T.LINE_HEIGHT``)自动算,多行文本才有区别 ——
     单行时上下各减一次,最终高度与 line_gap 无关,所以按钮不会因此变胖。
+
+    ``min_w`` 给图片一个最小宽度(图片比它窄时两侧留白,``align="center"`` 仍然居中):
+    按钮在「发送 / 生成中」这类不同文案之间切换时宽度不跳,旁边的控件就不会被推来推去。
     """
     bold = bold or T.TYPE[font_token][1] == "bold"
     if line_gap is None:
@@ -221,6 +242,8 @@ def render_label_box(
     asc, desc = font.getmetrics()
     line_h = asc + desc + line_gap
     w = text_w + 2 * pad_x
+    if min_w:
+        w = max(w, int(min_w))
     h = line_h * len(lines) + 2 * pad_y - line_gap
 
     if box_fill is None:
@@ -408,33 +431,12 @@ def selectable_text(
     ``state="disabled"``(禁用态在 Windows 上会吃掉一部分选择/复制交互),而是
     保持 normal 并在按键层拦截编辑,行为更接近网页上的只读文本。
 
-    行距按主题行高(``T.LINE_HEIGHT``)铺开,``line_gap=None`` 时自动算。
-
-    tk 的三个 spacing 语义各不相同,而 ``spacing2``(段内折行)会被 tk **上下对半
-    分配**给折点两侧 —— 实测的每行行盒是:
-
-    ===================== ==========================================
-    行的位置                实际行盒
-    ===================== ==========================================
-    单行段落               linespace + spacing1 + spacing3
-    多行段落的段首行        linespace + spacing1 + floor(spacing2/2)
-    多行段落的中间/段末行    linespace + ceil(spacing2/2) + …
-    硬换行(``\\n``)后那行    linespace + spacing3 + spacing1
-    ===================== ==========================================
-
-    要把这些**全部**拉到同一个行盒 ``linespace + gap``,只有一组解:
-    ``spacing1 = ceil(gap/2)``、``spacing2 = gap``、``spacing3 = floor(gap/2)``。
-    随手写成 ``spacing1=0, spacing2=spacing3=gap`` 会让段首行矮 4px、段末行矮 3px,
-    整段看着忽紧忽松 —— ``linecheck.py`` 就是钉这个的(断言每行行盒完全相等)。
-
-    顺带:单行段落的行盒 = linespace + spacing1 + spacing3 正好也是 ``fit_height``
-    折算 ``-height`` 用的基准,所以行距一改控件高度自动跟上。段与段之间的空档由
-    正文里的空行承担(空行本身也是一个"单行段落")。
+    行距按主题行高(``T.LINE_HEIGHT``)铺开,``line_gap=None`` 时自动算
+    (算法与理由见 ``line_spacing``)。单行段落的行盒 = linespace + spacing1 +
+    spacing3 正好也是 ``fit_height`` 折算 ``-height`` 用的基准,所以行距一改控件
+    高度自动跟上。段与段之间的空档由正文里的空行承担(空行本身也是一个"单行段落")。
     """
-    if line_gap is None:
-        line_gap = tk_line_gap_px(font)
-    half_hi = -(-line_gap // 2)  # ceil:折点上半
-    half_lo = line_gap // 2  # floor:折点下半
+    sp1, sp2, sp3 = line_spacing(font) if line_gap is None else (0, line_gap, 0)
     txt = tk.Text(
         parent,
         bg=bg,
@@ -447,9 +449,9 @@ def selectable_text(
         height=1,
         padx=pad_x,
         pady=pad_y,
-        spacing1=half_hi,
-        spacing2=line_gap,
-        spacing3=half_lo,
+        spacing1=sp1,
+        spacing2=sp2,
+        spacing3=sp3,
         cursor="xterm",
         insertwidth=0,
         takefocus=1,

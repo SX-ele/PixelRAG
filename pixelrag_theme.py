@@ -21,6 +21,10 @@ PALETTES: dict[str, dict[str, str]] = {
         "surface": "#F9F9F9",  # 侧栏 / 顶栏 / 底栏(DeepSeek 冷灰)
         "card": "#FFFFFF",  # 卡片表面
         "card_hover": "#F5F6F8",  # 卡片 hover
+        # 侧栏条目(DeepSeek 是浅灰圆角块,不是描边也不是蓝底):
+        # 底色是 surface(#F9F9F9),所以这两个值都要比它明显深一档才看得出来。
+        "nav_hover": "#F0F0F2",  # 条目 hover(11.9:1 上的文字仍清晰)
+        "nav_active": "#E4E6EA",  # 当前打开的那一条(比 hover 再实一点)
         "border": "#E5E7EB",  # 常规分隔线
         "border_strong": "#D1D5DB",  # hover / focus 时的边框
         "text": "#1F2329",  # 正文(15.8:1 on bg)
@@ -54,6 +58,8 @@ PALETTES: dict[str, dict[str, str]] = {
         "surface": "#1E1E1E",
         "card": "#242424",
         "card_hover": "#2A2A2A",
+        "nav_hover": "#2C2C2E",
+        "nav_active": "#38383C",
         "border": "#333333",
         "border_strong": "#454545",
         "text": "#E8E8E8",  # 14.2:1 on bg
@@ -130,6 +136,7 @@ TYPE: dict[str, tuple[int, str]] = {
     "bubble": (16, "normal"),  # 用户提问气泡
     "answer": (16, "normal"),  # 答案正文
     "input": (16, "normal"),  # 输入框
+    "code": (14, "normal"),  # 代码块(等宽;字号走 font_mono,行高同样受 LINE_HEIGHT 管)
     "side": (14, "normal"),  # 侧栏条目
     "label": (14, "bold"),  # 卡片标题
     "button": (14, "bold"),  # 按钮
@@ -207,27 +214,45 @@ def tk_scaling() -> float:
 # ---------------------------------------------------------------------------
 _BASE_SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "2xl": 32, "msg": 24}
 _BASE_RADIUS = {"sm": 6, "md": 8, "lg": 12}
+# 胶囊(整圆端头):给一个"远大于任何按钮高度"的值,绘制时会被自动夹到高度的一半
+# (见 widgets.render_label_box),于是按钮高度随字号 / DPI 变化时端头依然是半圆,
+# 调用方不需要先知道按钮多高。DeepSeek 的发送/停止按钮都是这个形状。
+RADIUS_PILL = 999
+# 滚动条宽度(DeepSeek 是细条、无可见槽)。tk 只能给像素值,所以跟着 UI_SCALE 走。
+_BASE_SCROLLBAR_W = 8
+SCROLLBAR_W = _BASE_SCROLLBAR_W
+# 发送按钮的最小宽度(设计像素):它在「发送 / 生成中」两种文案间切换,给个下限
+# 让它宽度不变,不然输入框里的文字会跟着一伸一缩。
+_BASE_SEND_MIN_W = 72
+SEND_MIN_W = _BASE_SEND_MIN_W
+# 组件级尺寸(设计像素):不在 4px 栅格上、但 DeepSeek 有明确规格的那几个。
+# 单列出来是为了不被"顺手对齐到栅格"改掉 —— 改了就不是 DeepSeek 的比例了。
+_BASE_BUBBLE_PAD = (14, 10)  # 用户气泡内边距 (横向, 纵向)
 # 消息列的宽度上限(DeepSeek 是 768)。窗口再宽也不跟着变宽 —— 富余的宽度均分成
 # 两侧留白,正文始终是一条居中的窄栏,长行才不会横贯整屏。
 _BASE_CONTENT_MAX_WIDTH = 768
 
-# 下面三个是"逻辑值 × UI_SCALE"的结果;启动时由 set_ui_scale 按屏幕 DPI 重算,
+# 下面几个是"逻辑值 × UI_SCALE"的结果;启动时由 set_ui_scale 按屏幕 DPI 重算,
 # 以便在高分屏上字变大的同时,内边距/圆角/行宽等比跟上,不会显得局促。
 SPACE: dict[str, int] = dict(_BASE_SPACE)
 RADIUS: dict[str, int] = dict(_BASE_RADIUS)
+BUBBLE_PAD: tuple[int, int] = _BASE_BUBBLE_PAD
 CONTENT_MAX_WIDTH = _BASE_CONTENT_MAX_WIDTH
 UI_SCALE = 1.0
 
 
 def set_ui_scale(factor: float) -> float:
     """按屏幕缩放比例重算所有像素级令牌(0.75x ~ 2.0x)。"""
-    global UI_SCALE, CONTENT_MAX_WIDTH
+    global UI_SCALE, CONTENT_MAX_WIDTH, BUBBLE_PAD, SCROLLBAR_W, SEND_MIN_W
     UI_SCALE = max(0.75, min(2.0, float(factor)))
     for k, v in _BASE_SPACE.items():
         SPACE[k] = max(1, round(v * UI_SCALE))
     for k, v in _BASE_RADIUS.items():
         RADIUS[k] = max(2, round(v * UI_SCALE))
+    BUBBLE_PAD = tuple(max(1, round(v * UI_SCALE)) for v in _BASE_BUBBLE_PAD)
     CONTENT_MAX_WIDTH = round(_BASE_CONTENT_MAX_WIDTH * UI_SCALE)
+    SCROLLBAR_W = max(4, round(_BASE_SCROLLBAR_W * UI_SCALE))
+    SEND_MIN_W = max(24, round(_BASE_SEND_MIN_W * UI_SCALE))
     return UI_SCALE
 
 

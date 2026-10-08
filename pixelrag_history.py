@@ -158,6 +158,48 @@ def _elide(text: str, font_spec: tuple, max_px: int) -> str:
     return text[:lo] + "…"
 
 
+def _rounded_bg(host: tk.Widget, bg: str, radius: int):
+    """在 ``host`` 里铺一张"跟着宿主尺寸变"的圆角底图,返回换填充色的函数。
+
+    tk 没有 CSS 圆角,只能画一张图贴上去。要点有三个:
+
+    - Canvas 用 ``place`` 铺满宿主、**不参与尺寸计算**,所以宿主的宽高仍然由里面的
+      内容(文字)决定 —— 行高不用自己算;
+    - Canvas 必须是最后创建、再 ``lower()``:同一父窗口里后创建的子窗口在上层,
+      不沉底就会把文字盖住(Label 的文字是父窗口自己画的,子窗口一定盖得住);
+    - 同尺寸同色的图由 ``W.rounded_photo`` 缓存,200 行也只会画几张图。
+
+    ``bg`` 是圆角外面"挖空"那部分透出的颜色 —— 必须是宿主的底色,不是宿主的底色
+    就会在圆角处露出方块。
+    """
+    cv = tk.Canvas(host, bg=bg, highlightthickness=0, bd=0)
+    cv.place(x=0, y=0, relwidth=1, relheight=1)
+    item = cv.create_image(0, 0, anchor="nw")
+    state: dict = {"fill": None, "photo": None}
+
+    def paint(_e=None):
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w <= 1 or h <= 1 or state["fill"] is None:
+            return
+        photo = W.rounded_photo(w, h, radius, state["fill"], bg)
+        if photo is not state["photo"]:
+            state["photo"] = photo  # 必须持有引用,否则会被 GC 成白块
+            cv.itemconfigure(item, image=photo)
+
+    cv.bind("<Configure>", paint)
+    host.after_idle(paint)
+
+    def set_fill(fill: str):
+        state["fill"] = fill
+        paint()
+
+    # 注意不能写 cv.lower():Canvas 把 lower 覆写成了 tag_lower(画布里的图层操作)。
+    # 要沉的是**窗口**,得回到 Misc 的那个 lower。
+    tk.Misc.lower(cv)
+    # 也返回画布:它铺满宿主,子控件够不到的边缘(圆角那两头)只有它收得到鼠标事件
+    return cv, set_fill
+
+
 class HistorySidebar(tk.Frame):
     """主窗口左侧的历史栏:新对话 / 历史列表 / 清空。
 
@@ -183,10 +225,17 @@ class HistorySidebar(tk.Frame):
         self.on_new = on_new
         self.on_clear = on_clear
         self._current: dict | None = None
-        # 一行放问题的宽度:去掉左右留白和行尾「重问」的位置
+        # 行内条目离侧栏边缘的留白:圆角块要缩进来一点才看得出是"块"
+        self._pad = T.SPACE["sm"]
+        # 一行放问题的宽度:去掉两端留白、文本块的左留白、行尾固定的「重问」槽,
+        # 再减掉滚动条 —— 滚动条一露面画布就窄这么多,不减的话省略号会被裁掉。
         self._text_w = max(
             80,
-            int(SIDEBAR_W * T.UI_SCALE) - 3 * T.SPACE["md"] - int(34 * T.UI_SCALE),
+            int(SIDEBAR_W * T.UI_SCALE)
+            - 2 * self._pad
+            - 2 * T.SPACE["sm"]
+            - int(34 * T.UI_SCALE)
+            - T.SCROLLBAR_W,
         )
         self._build()
         self.refresh()
@@ -196,23 +245,35 @@ class HistorySidebar(tk.Frame):
     def _build(self):
         top = tk.Frame(self, bg=T.c("surface"))
         top.pack(side="top", fill="x", padx=T.SPACE["sm"], pady=T.SPACE["sm"])
+        # 「＋ 新对话」是整条圆角胶囊(DeepSeek 侧栏顶部就是这样),不是描边按钮。
+        # 圆角底图必须**后建再沉底**:Label 的文字是它自己画的,子窗口一定盖得住,
+        # 底图先建就会被 Label 反过来糊住。Label 再向内缩一点,它的方角才不会啃到圆角。
         self.new_btn = tk.Label(
             top,
             text="＋   新对话",
             bg=T.c("surface"),
-            fg=T.c("accent"),
+            fg=T.c("text"),
             font=T.font("button"),
             anchor="w",
             cursor="hand2",
             padx=T.SPACE["sm"],
             pady=T.SPACE["sm"],
         )
-        self.new_btn.pack(fill="x")
+        self.new_btn.pack(fill="x", padx=T.SPACE["xs"], pady=T.SPACE["xs"])
+        new_cv, set_new_fill = _rounded_bg(top, T.c("surface"), T.RADIUS["md"])
+
+        def new_hover(on: bool):
+            fill = T.c("nav_hover") if on else T.c("surface")
+            set_new_fill(fill)
+            self.new_btn.configure(bg=fill)
+
         self.new_btn.bind("<Button-1>", lambda _e: self._new())
+        new_cv.configure(cursor="hand2")
+        new_cv.bind("<Button-1>", lambda _e: self._new())
         W.bind_hover(
             self.new_btn,
-            on_enter=lambda: self.new_btn.configure(bg=T.c("accent_soft")),
-            on_leave=lambda: self.new_btn.configure(bg=T.c("surface")),
+            on_enter=lambda: new_hover(True),
+            on_leave=lambda: new_hover(False),
         )
         W.make_focusable(self.new_btn, T.c("surface"), self._new)
         tk.Frame(self, bg=T.c("border"), height=1).pack(side="top", fill="x")
@@ -270,7 +331,7 @@ class HistorySidebar(tk.Frame):
             troughcolor=T.c("surface"),
             activebackground=T.c("border_strong"),
             borderwidth=0,
-            width=10,
+            width=T.SCROLLBAR_W,
             relief="flat",
             elementborderwidth=0,
         )
@@ -346,26 +407,27 @@ class HistorySidebar(tk.Frame):
 
     def _row(self, item: dict):
         cur = item is self._current
-        base = T.c("accent_soft") if cur else T.c("surface")
-        row = tk.Frame(self.list, bg=base)
-        row.pack(fill="x", padx=T.SPACE["xs"], pady=1)
+        # DeepSeek 的当前条目是一个中性灰圆角块(不是蓝底),文字仍是正文色
+        fill = T.c("nav_active") if cur else T.c("surface")
+        row = tk.Frame(self.list, bg=T.c("surface"))
+        row.pack(fill="x", padx=self._pad, pady=1)
 
         # 行尾「重问」:固定宽度占位,平时留空 —— 显隐时不会挤动左边的问题
         ask = tk.Label(
             row,
             text="重问" if (cur and self.on_reask) else "",
             width=4,
-            bg=base,
-            fg=T.c("accent"),
+            bg=fill,
+            fg=T.c("accent_text"),
             font=T.font("micro"),
             cursor="hand2",
             anchor="e",
         )
-        ask.pack(side="right", padx=(0, T.SPACE["sm"]))
+        ask.pack(side="right", padx=(0, T.SPACE["sm"]), pady=T.SPACE["xs"])
         if self.on_reask:
             ask.bind("<Button-1>", lambda _e, q=item["question"]: self._reask(q))
 
-        box = tk.Frame(row, bg=base)
+        box = tk.Frame(row, bg=fill)
         box.pack(
             side="left",
             fill="x",
@@ -376,8 +438,8 @@ class HistorySidebar(tk.Frame):
         tk.Label(
             box,
             text=_elide(item["question"], T.font("side"), self._text_w),
-            bg=base,
-            fg=T.c("accent") if cur else T.c("text"),
+            bg=fill,
+            fg=T.c("text"),
             font=T.font("side"),
             anchor="w",
             justify="left",
@@ -390,29 +452,39 @@ class HistorySidebar(tk.Frame):
         tk.Label(
             box,
             text=meta,
-            bg=base,
+            bg=fill,
             fg=T.c("text_faint"),
             font=T.font("micro"),
             anchor="w",
             justify="left",
         ).pack(anchor="w", fill="x")
 
+        # 圆角底图最后建(于是它在 winfo_children() 里排第 3)再沉底。
+        # 底色传 surface 而不是 fill:圆角挖掉的那四个角要透出列表底色,
+        # 传 fill 就成了一个方角块。
+        bg_cv, set_fill = _rounded_bg(row, T.c("surface"), T.RADIUS["md"])
+        set_fill(fill)
+
         def enter(_e=None):
-            if item is not self._current:
-                W.set_bg_recursive(row, T.c("card_hover"))
+            if not cur:
+                set_fill(T.c("nav_hover"))
+                W.set_bg_recursive(row, T.c("nav_hover"))
             if self.on_reask:
                 ask.configure(text="重问")
 
         def leave(_e=None):
-            if item is not self._current:
-                W.set_bg_recursive(row, base)
-            if not (item is self._current):
+            if not cur:
+                set_fill(fill)
+                W.set_bg_recursive(row, fill)
                 ask.configure(text="")
 
         W.bind_hover(row, on_enter=enter, on_leave=leave)
         W.bind_click_recursive(box, lambda i=item: self._open(i))
         W.set_cursor_recursive(box)
         W.make_focusable(row, T.c("surface"), lambda i=item: self._open(i))
+        # 圆角块的两头(子控件够不到的地方)也要能点、能呼出右键菜单
+        bg_cv.configure(cursor="hand2")
+        bg_cv.bind("<Button-1>", lambda _e, i=item: self._open(i), add="+")
 
         menu = tk.Menu(row, tearoff=0, font=T.font("caption"))
         menu.add_command(label="打开这轮问答", command=lambda i=item: self._open(i))
@@ -429,11 +501,12 @@ class HistorySidebar(tk.Frame):
             menu.add_command(
                 label="复制答案", command=lambda t=item["answer"]: self._copy(t)
             )
-        row.bind(
-            "<Button-3>",
-            lambda e, m=menu: self._popup(e, m),
-            add="+",
-        )
+        for w in (row, bg_cv):
+            w.bind(
+                "<Button-3>",
+                lambda e, m=menu: self._popup(e, m),
+                add="+",
+            )
 
     # ---------- 动作 ----------
 
