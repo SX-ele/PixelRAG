@@ -275,6 +275,15 @@ def main():
         "--instruction", default="", help="Instruction prefix for queries"
     )
     parser.add_argument("--limit", type=int, default=None, help="Max chunks to embed")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Save a resume checkpoint every N chunks (default: 1). Embedding "
+        "keeps all progress in memory; only the checkpoint survives a kill, so "
+        "this bounds what an OOM kill costs. The write is a few MB at most, so "
+        "saving after every chunk is cheap.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -289,12 +298,20 @@ def main():
         items = items[: args.limit]
     else:
         logger.info("Found %d chunks to embed", len(items))
+
+    checkpoint_every = max(1, args.checkpoint_every)
+    logger.info(
+        "Checkpoint every %d chunk(s) -> %s (an OOM kill costs at most that much)",
+        checkpoint_every,
+        Path(args.output_dir) / "embed_checkpoint.npz",
+    )
     embeddings, checkpoint_path = embed_items(
         items,
         args.model,
         device=args.device,
         instruction=args.instruction,
         checkpoint_dir=args.output_dir,
+        checkpoint_every=checkpoint_every,
     )
 
     output_path = Path(args.output_dir) / "shard_000.npz"
