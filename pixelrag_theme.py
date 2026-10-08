@@ -115,8 +115,12 @@ FONT_MONO = "Consolas"
 TYPE: dict[str, tuple[int, str]] = {
     "title": (15, "bold"),  # 顶栏标题
     "h2": (12, "bold"),  # 区块标题 / 引用来源
-    "body": (11, "normal"),  # 正文
-    "body_lg": (12, "normal"),  # 输入框
+    "body": (11, "normal"),  # 正文(欢迎语 / 提示 / 错误)
+    "body_lg": (12, "normal"),  # 大号正文
+    "bubble": (13, "normal"),  # 用户提问气泡:比正文大一号,一眼能认出"我问的"
+    "answer": (10, "normal"),  # 答案正文:读长文,比正文收一号
+    "input": (10, "normal"),  # 输入框
+    "side": (10, "normal"),  # 侧栏条目:导航文字要退到正文后面,别抢阅读焦点
     "label": (11, "bold"),  # 卡片标题
     "button": (11, "bold"),  # 按钮
     "caption": (9, "normal"),  # 卡片元信息

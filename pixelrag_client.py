@@ -36,6 +36,9 @@ N_DOCS = 5
 HEALTH_URL = f"http://{HOST}:{PORT}/health"
 SEARCH_URL = f"http://{HOST}:{PORT}/search"
 ARTICLES_JSON = os.path.join(ROOT, "knowledge_index", "articles.json")
+TILES_DIR = os.path.join(
+    ROOT, "knowledge_index", "tiles"
+)  # 与 _serve_cmd 里的 --tiles-dir 同一处
 
 # ---- VLM 生成配置(DeepSeek-V4.1-Flash,原生视觉)----
 VLM_MODEL = (
@@ -49,8 +52,9 @@ VLM_MAX_SIDE = 1568  # 截图长边像素上限(超出即压缩)
 # (界面表现就是"模型没有返回任何内容")。实测 8192 能稳定作答。
 VLM_MAX_TOKENS = 8192
 
-# 窗口逻辑尺寸(会按屏幕 DPI 缩放)
-WIN_W, WIN_H = 900, 780
+# 窗口逻辑尺寸(会按屏幕 DPI 缩放)。比原来宽,是因为左边多了历史栏。
+WIN_W, WIN_H = 1140, 800
+WIN_MIN_W = 880  # 侧栏可收起,但收起后对话区也不该挤到读不了
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +135,31 @@ def _load_titles() -> dict[int, str]:
         return {i: (a.get("title") or "") for i, a in enumerate(arts)}
     except Exception:
         return {}
+
+
+def history_tiles(item: dict) -> list[tuple[str, dict]]:
+    """把历史里的引用页还原成 ``(图片 base64, hit)``。
+
+    读的是本地 tiles 目录,所以打开旧问答既不联网也不用检索服务;
+    文件被删掉时缩略图留空,卡片其余信息照常显示。
+    """
+    out: list[tuple[str, dict]] = []
+    for ref in item.get("refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        b64 = ""
+        try:
+            article = int(ref.get("article_id"))
+            tile = int(ref.get("tile_index"))
+            path = os.path.join(
+                TILES_DIR, f"{article}.png.tiles", f"tile_{tile:04d}.jpg"
+            )
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+        except Exception:
+            b64 = ""
+        out.append((b64, dict(ref)))
+    return out
 
 
 def screen_scale() -> float:
@@ -273,7 +302,7 @@ class App:
         self.root = root
         root.title("PixelRAG 视觉问答")
         root.configure(bg=T.c("bg"))
-        root.minsize(int(660 * T.UI_SCALE), int(480 * T.UI_SCALE))
+        root.minsize(int(WIN_MIN_W * T.UI_SCALE), int(480 * T.UI_SCALE))
 
         # 消息数据模型:主题切换 / 窗口缩放时据此重放渲染
         self.messages: list[dict] = []
@@ -294,9 +323,11 @@ class App:
         self._gen = None
         self._stopped = False
         self._last_question: str | None = None
-        # 查询历史:落盘存储 + 面板 + 输入框上下键召回
+        # 查询历史:落盘存储 + 左侧栏 + 输入框上下键召回
         self.history = H.History()
-        self._history_panel: H.HistoryPanel | None = None
+        self.sidebar: H.HistorySidebar | None = None
+        self._sidebar_open = True  # 顶栏「历史」按钮切换它
+        self._current_hist: dict | None = None  # 当前打开的那轮问答
         self._hist_entry: dict | None = None  # 本次提问对应的历史条目,答完回填
         self._hist_pos: int | None = None  # None = 不在召回态;0 = 最新一条
         self._hist_draft = ""  # 召回前用户已经敲了一半的内容
@@ -456,7 +487,7 @@ class App:
             relief="flat",
             bd=0,
             highlightthickness=0,
-            font=T.font("body_lg"),
+            font=T.font("input"),
             wrap="word",
             padx=0,
             pady=0,
@@ -492,6 +523,21 @@ class App:
     def _build_body(self):
         body = tk.Frame(self.root, bg=T.c("bg"))
         body.pack(side="top", fill="both", expand=True)
+        self.body = body
+
+        # 左侧历史栏(DeepSeek 式)。顶栏/底栏仍是通栏,只有中间分左右。
+        self.sidebar = None
+        if self._sidebar_open:
+            self.sidebar = H.HistorySidebar(
+                body,
+                self.history,
+                on_open=self._open_history_item,
+                on_reask=self._reask,
+                on_new=self._new_chat,
+            )
+            self.sidebar.pack(side="left", fill="y")
+            tk.Frame(body, bg=T.c("border"), width=1).pack(side="left", fill="y")
+            self.sidebar.set_current(self._current_hist)
 
         self.canvas = tk.Canvas(body, bg=T.c("bg"), highlightthickness=0, bd=0)
         self.scroll = tk.Scrollbar(
@@ -542,6 +588,9 @@ class App:
         )
 
     def _on_wheel(self, event):
+        # 这个绑定是 bind_all 的,滚轮落在侧栏上时不该带着对话区一起滚
+        if self.sidebar is not None and str(event.widget).startswith(str(self.sidebar)):
+            return
         try:
             self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
         except Exception:
@@ -654,7 +703,7 @@ class App:
         row.pack(fill="x", padx=T.SPACE["xl"], pady=(T.SPACE["lg"], T.SPACE["xs"]))
         img = W.render_label_box(
             msg["text"],
-            "body",
+            "bubble",
             T.c("user_text"),
             T.c("bg"),
             box_fill=T.c("user_bubble"),
@@ -764,7 +813,7 @@ class App:
         # 否则窗口一宽,长行就会横贯整个画布(和引用卡片对不齐)。
         avail = max(1, self.canvas.winfo_width() - 2 * T.SPACE["xl"])
         inset = max(0, (avail - self._content_w) // 2)
-        txt = W.selectable_text(container, T.font("body"), T.c("bg"), T.c("text"))
+        txt = W.selectable_text(container, T.font("answer"), T.c("bg"), T.c("text"))
         txt.pack(fill="x", padx=(inset, inset))
         W.attach_text_menu(txt, self.root)
         txt.tag_configure(
@@ -1156,6 +1205,10 @@ class App:
         self._hist_entry = self.history.remember(text)
         self._hist_pos = None
         self._hist_draft = ""
+        # 新问一轮就离开"打开旧问答"的状态;这一步顺带把新条目刷进侧栏
+        self._current_hist = None
+        if self.sidebar is not None:
+            self.sidebar.set_current(None)
         self._busy = True
         self._update_send_button()
         self._show_stop(True)
@@ -1186,18 +1239,50 @@ class App:
     # ---------- 查询历史 ----------
 
     def _on_history(self):
-        if self._history_panel is not None:
-            self._history_panel.win.lift()
-            return
-        self._history_panel = H.HistoryPanel(
-            self.root,
-            self.history,
-            on_pick=self._reask,
-            on_close=self._forget_history_panel,
-        )
+        """顶栏「历史」= 收起 / 展开左侧栏。"""
+        self._sidebar_open = not self._sidebar_open
+        self._rebuild_ui()
 
-    def _forget_history_panel(self):
-        self._history_panel = None
+    def _refresh_sidebar(self):
+        if self.sidebar is not None:
+            self.sidebar.refresh()
+
+    def _new_chat(self):
+        """开一段新对话:主区域回到欢迎语,历史一条不动。"""
+        if self._busy:  # 生成中换视图会让答案落到错误的对话里
+            return
+        self._current_hist = None
+        self.messages = []
+        self._render_all((True, 0.0))
+        self._add_welcome()
+        self._clear_input()
+        if self.sidebar is not None:
+            self.sidebar.set_current(None)
+        self._scroll_bottom(True)
+
+    def _open_history_item(self, item: dict):
+        """打开一条历史:还原当时的提问 / 答案 / 引用卡片。
+
+        答案和引用页都存在历史里,所以这里不检索、不调模型;缩略图直接读本地 tiles。
+        """
+        if self._busy:
+            return
+        self._current_hist = item
+        if self.sidebar is not None:
+            self.sidebar.set_current(item)
+        self._clear_input()
+        self.messages = []
+        self._render_all((False, 0.0))
+        self._add_user(item.get("question", ""))
+        answer = item.get("answer") or ""
+        if answer:
+            self._append({"kind": "answer", "text": answer, "streaming": False})
+        else:
+            self._add_note("这条提问没有存下答案,点它右边的「重问」可以重新生成。")
+        tiles = history_tiles(item)
+        if tiles:
+            self._append({"kind": "citations", "tiles": tiles})
+        self._scroll_bottom(True)
 
     def _reask(self, question: str):
         """从历史里点一条:填进输入框并直接提问。"""
@@ -1509,12 +1594,24 @@ class App:
             else:
                 self._redraw_answer(msg)
 
-        # 回填历史:命中页数 + 答案(方便以后直接复制,不用重跑一遍)
+        # 回填历史:命中页数 + 答案 + 引用页。存下引用页是为了以后点开这条历史时
+        # 能把引用卡片一起还原 —— 缩略图从本地 tiles 读,不用再问一次检索服务。
         self.history.update(
             self._hist_entry,
             hits=len(images),
             answer=(msg or {}).get("text", ""),
+            refs=[
+                {
+                    "article_id": h.get("article_id"),
+                    "tile_index": h.get("tile_index"),
+                    "chunk_index": h.get("chunk_index"),
+                    "score": h.get("score"),
+                    "url": h.get("url"),
+                }
+                for _b64, h in images
+            ],
         )
+        self._refresh_sidebar()
 
         if images:
             self._append({"kind": "citations", "tiles": list(images)})
@@ -1564,13 +1661,16 @@ class App:
 
     def _apply_theme(self):
         """换主题 = 用令牌重放全部界面(tkinter 不支持热改样式)。"""
+        self._rebuild_ui()
+
+    def _rebuild_ui(self):
+        """按当前令牌重放整个界面。换主题、收起/展开侧栏都走这里。
+
+        tkinter 没有"只重画"这条路,一律销毁重建;输入到一半的内容和滚动位置
+        在销毁前取出来,重建后放回去。
+        """
         draft = self.input.get("1.0", "end-1c")
         state = self._view_state()  # 必须在销毁旧界面之前取
-        # 历史面板是独立窗口,颜色也是构建时取的 —— 关掉,重建完再打开
-        reopen_history = self._history_panel is not None
-        if self._history_panel is not None:
-            self._history_panel.close()
-            self._history_panel = None
 
         for w in self.root.winfo_children():
             w.destroy()
@@ -1583,8 +1683,6 @@ class App:
         self._render_all(view_state=state)
         self._set_status()
         self._update_send_button()
-        if reopen_history:
-            self._on_history()
 
     # ---------- 打开图片 / PDF ----------
 
